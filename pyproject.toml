@@ -27,6 +27,10 @@ dependencies = [
 api = ["fastapi>=0.110", "uvicorn>=0.27"]
 dev = ["pytest>=7.0", "httpx>=0.27"]
 
+[project.scripts]
+# One command from a checkout or from a URL: `tool-market web`.
+tool-market = "toolmarket.cli:main"
+
 [tool.setuptools.packages.find]
 include = ["toolmarket*"]
 
