@@ -13,6 +13,11 @@ authors = [{ name = "Zhang Yangyi" }]
 keywords = ["agents", "tools", "protocol", "agp", "lifecycle", "provenance"]
 dependencies = [
     "pydantic>=2.0",
+    # The enforcement engine. Pinned to a git ref because the local sibling
+    # checkout is a dev convenience, not something a fresh clone has. Without
+    # this, `pip install -e .` succeeds and then every import of the validity
+    # gate fails -- which is exactly the failure this line exists to prevent.
+    "autoforge @ git+https://github.com/ZhangYangyi03/autoforge.git@main",
 ]
 
 [project.optional-dependencies]

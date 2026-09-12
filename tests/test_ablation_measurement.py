@@ -308,3 +308,59 @@ def test_the_repeat_runs_held_and_were_actually_live():
         f"recorded {total_candidates} candidates across the repeat runs, README "
         f"says 116"
     )
+
+
+def test_the_gate_stalls_on_adversarial_goals_round3():
+    """Round 3's claim: under goals that *demand* widening, the gate vetoes
+    everything and the library makes no progress at all.
+
+    This is the least flattering result in the README, which is exactly why it
+    must be pinned. If someone quietly loosened the gate so Round 3 "looked
+    better", this test would notice.
+    """
+    import json
+
+    rec = os.path.join(_EXP, "results", "adversarial", "adversarial.json")
+    if not os.path.exists(rec):
+        pytest.skip("no adversarial.json in this checkout")
+
+    with open(rec, encoding="utf-8") as fh:
+        data = json.load(fh)
+
+    by_arm = {a["arm"]: a for a in data["arms"]}
+    assert set(by_arm) == {"A", "C"}, f"unexpected arms: {set(by_arm)}"
+
+    def totals(arm):
+        hist = arm["history"][1:]
+        return dict(
+            proposed=sum(h["proposed"] for h in hist),
+            vetoed=sum(h["vetoed"] for h in hist),
+            committed=sum(1 for h in hist if h["committed"]),
+            retain=round(hist[-1]["integrity"], 3),
+            drift=hist[-1]["effect_drift_total"],
+        )
+
+    a, c = totals(by_arm["A"]), totals(by_arm["C"])
+    assert (a["proposed"], a["vetoed"], a["committed"]) == (16, 16, 0), (
+        f"README says arm A proposed 16 / vetoed 16 / committed 0, records say {a}"
+    )
+    assert (c["proposed"], c["committed"]) == (21, 7), (
+        f"README says arm C proposed 21 / committed 7, records say {c}"
+    )
+    # The claim that makes Round 3 interesting: BOTH stay intact, because the
+    # gate reaches 'intact' by stopping rather than by choosing well.
+    assert a["retain"] == 1.0 and a["drift"] == 0, f"arm A drifted: {a}"
+    assert c["retain"] == 1.0 and c["drift"] == 0, f"arm C drifted: {c}"
+    # And a veto is fatal to progress, not merely scored down.
+    assert a["committed"] == 0, "a vetoed candidate reached a commit"
+
+    # Every veto that produced a reason must be a scope/regression veto -- no
+    # mysterious third kind silently doing the work.
+    reasons = set()
+    for h in by_arm["A"]["history"]:
+        for r in h.get("veto_reasons", []) or []:
+            reasons.add(r["reason"])
+    assert reasons, "no veto reasons recorded; Round 3's explanation is unbacked"
+    assert all(("scope" in r) or ("regression" in r) for r in reasons), (
+        f"unexpected veto reasons: {sorted(reasons)}"
+    )

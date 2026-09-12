@@ -164,6 +164,42 @@ This also explains an earlier single-sample result: one 8-generation run of arm
 C finished with drift 0 and looked like proof the hint was sufficient. At a 20%
 per-roll failure rate, that run was the expected outcome, not evidence.
 
+### Round 3 — the way enforcement fails instead
+
+Rounds 1–2 show the gate refusing what the prompt let through. That is half the
+picture; the other half is less flattering to the gate. The *same* hard-widening
+goals were run against **arm A (gate on, plain prompt)** and **arm C (no gate,
+preserve hint)**:
+
+| Arm | proposed | vetoed | committed | retain | drift |
+|---|---|---|---|---|---|
+| A (gate) | 16 | **16** | **0** | 1.000 | 0 |
+| C (hint) | 21 | 0 | 7 | 1.000 | 0 |
+
+- **A is inert.** Every single candidate was vetoed — all of them for `scope`,
+  some additionally for `regression` — so eight generations produced no version
+  bump at all. The library is intact because it is *frozen*. The gate cannot
+  distinguish "this would break the contract" from "this would extend it, which
+  the goal demands", and against goals that are genuinely unreachable inside the
+  declared scope it has no path forward: it does not degrade, it stops.
+- **C held this time.** Same live sample size (8 calls, 0 cached), retain 1.000.
+  Which is the point — on identical adversarial goals one run of arm C wrote six
+  widening candidates (Round 2) and another wrote none (here). The gate's outcome
+  is a function of the candidate; the hint's is a function of the draw.
+
+So the honest summary is not "the gate works and the prompt does not". It is that
+the two fail **differently**:
+
+| | failure mode | visible? | recoverable? |
+|---|---|---|---|
+| prompt only | silent widening — library drifts | no | only if something else notices |
+| gate only | loud stall — no progress | yes, with a reason | yes: a human extends the contract |
+
+For an evolving library, a loud stop is the failure you can act on. A silent
+widening is the one you cannot. Neither arm is a complete answer; that is a real
+limitation of this work, stated here rather than left for a reader to find.
+n=1 run each, so this is an illustration of the failure *mode*, not a rate.
+
 ### What this does and does not show
 
 - **Shows** that a prompt-level guard stops being reliable the moment the goal
@@ -171,12 +207,19 @@ per-roll failure rate, that run was the expected outcome, not evidence.
 - **Shows** the gate's verdict is a function of the code alone: the same unsafe
   candidate assessed 200 times yields one verdict and one reason
   (`tests/test_gate_determinism.py`).
+- **Shows** that enforcement is not free: a veto-only gate *stalls* on goals that
+  legitimately require extending the declared scope (Round 3), which is a design
+  gap, not a measurement artifact.
 - **Does not show** the hint is useless. It held 12/15 and was sufficient on the
   polite goal set. The point is that you cannot *audit* it, and you cannot tell
   a 12/15 day from a 15/15 day without a mechanism that does not share the
   model's discretion.
-- **Scale**: n=15 rolls on one model, 8 generations, three seed tools. This is
-  evidence, not a law. `experiments/` contains everything needed to re-run it.
+- **Does not** solve the stall. The intended fix — a contract-amendment path
+  where a widening is *approved as a new baseline* rather than silently taken —
+  is not implemented. Until it is, the gate is a brake, not a steering wheel.
+- **Scale**: n=15 rolls and n=6 runs on one model, 8 generations, three seed
+  tools. This is evidence, not a law. `experiments/` contains everything needed
+  to re-run it.
 - **Known gap**: on *first* approval `ValidityGate` records an inconsistent
   scope declaration without blocking it unless `require_scope_declaration=True`.
   The evolution path is unaffected — it compares against a frozen baseline —
@@ -186,9 +229,10 @@ Reproduce:
 
 ```bash
 python -u experiments/ablation_gate.py --generations 8 --arms A,B,C   # Round 1
+python -u experiments/ablation_adversarial.py --arms A,C             # Round 3
 python -u experiments/ablation_hint_stress.py --rolls 5              # Round 2
 python -u experiments/replay_pool.py                                 # pool audit
-python -m pytest -q                                                  # 32 tests
+python -m pytest -q                                                  # 33 tests
 
 # Round 1 arm C, repeated live (the 6-of-6 claim):
 for i in 1 2 3 4 5; do
@@ -202,20 +246,29 @@ rather than the gate: one asserts that an ungated widening is actually visible
 as drift, one that the gate vetoes that same candidate, one that the verdict is
 repeatable, and one that **the table above equals `ablation_real.json`** — that
 last test is how the arm-B figure in this README got corrected from a wrong
-0.167 to the recorded 0.000. If the first ever breaks, the experiment would
-report "intact" for every arm and quietly become worthless — so these are red
-tests, not charts.
+0.167 to the recorded 0.000. Two more pin the numbers a reader is most likely to
+doubt: that the six repeat runs really were uncached and really did hold, and
+that Round 3's stall (16/16 vetoed, 0 committed) is what the records say. If the
+first ever breaks, the experiment would report "intact" for every arm and
+quietly become worthless — so these are red tests, not charts.
 
 ---
 
 ## Quickstart
 
 ```bash
+./run_demo.sh          # Linux/macOS   — installs, then runs the demo
+run_demo.cmd           # Windows       — same
+```
+
+Or by hand:
+
+```bash
 pip install -e ../autoforge     # the enforcement engine
 pip install -e .                # this substrate
 
 python examples/demo_evolution.py      # end-to-end, incl. a veto you can see
-python -m pytest -q                    # 32 tests
+python -m pytest -q                    # 33 tests
 ```
 
 ### API
@@ -251,6 +304,7 @@ descriptor (`additionalProperties: false`).
 ## Layout
 
 ```
+run_demo.sh / run_demo.cmd   # one-command entry point (installs, then demos)
 toolmarket/
   protocol/
     lifecycle.py   # the 5-state FSM + AGP's 3 version statuses + legal edge set
