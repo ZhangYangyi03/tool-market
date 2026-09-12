@@ -164,6 +164,27 @@ This also explains an earlier single-sample result: one 8-generation run of arm
 C finished with drift 0 and looked like proof the hint was sufficient. At a 20%
 per-roll failure rate, that run was the expected outcome, not evidence.
 
+**A false-positive label hid inside this table.** The first pass of these 15
+rolls ran against an auditor that read `re.compile(...)` as
+`dynamic_code_execution`. That is simply wrong — a builtin is only ever reached
+by its bare name, never through attribute access — but it was enough to break
+the one seed that uses `re.compile`. `redact_secrets` declares scope `pure`, and
+`pure` cannot permit `dynamic_code_execution`, so the scope gate rejected
+*every* candidate for that tool, including one byte-identical to the seed. The
+tool could never be committed to again, for any goal, ever. And a dead tool
+looks exactly like a well-behaved one from the outside: its 5 rolls still
+counted as "hint held".
+
+So of the 15 rolls above, 5 were not evidence — they were a veto that no
+candidate could have survived. The auditor was fixed in autoforge (guarded by
+`test_regex_compile_is_not_dynamic_code_execution`, plus a substrate-level
+`test_no_seed_is_un_evolvable_by_its_own_gate` that replays every seed through
+its own gate), and the matrix was re-rolled live. The totals are unchanged —
+12/15, 6 widening candidates, 0 admitted — but all 15 rolls are now
+measurements. Round 1 is provably unaffected: replaying its recorded candidate
+pools against the fixed auditor reproduces `ablation_real.json` exactly, because
+the candidates vetoed there genuinely do widen.
+
 ### Round 3 — the way enforcement fails instead
 
 Rounds 1–2 show the gate refusing what the prompt let through. That is half the
@@ -210,6 +231,11 @@ n=1 run each, so this is an illustration of the failure *mode*, not a rate.
 - **Shows** that enforcement is not free: a veto-only gate *stalls* on goals that
   legitimately require extending the declared scope (Round 3), which is a design
   gap, not a measurement artifact.
+- **Shows** the harness can be made to audit itself. The
+  `dynamic_code_execution` false positive (Round 2) was invisible in every
+  aggregate number; it only surfaced by asking a question the tables cannot
+  answer — can each seed clear its own gate? That check now runs in the suite,
+  so the same class of dead tool cannot hide again.
 - **Does not show** the hint is useless. It held 12/15 and was sufficient on the
   polite goal set. The point is that you cannot *audit* it, and you cannot tell
   a 12/15 day from a 15/15 day without a mechanism that does not share the

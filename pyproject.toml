@@ -20,7 +20,7 @@ dependencies = [
     # Pin the commit, not the branch: `@main` would silently re-fetch a newer
     # engine and quietly invalidate the reproduction instructions in the
     # README the next time someone ran them.
-    "autoforge @ git+https://github.com/ZhangYangyi03/autoforge.git@fb088dd9be9c55fc2d9f74ebc70790d5c6e4d983",
+    "autoforge @ git+https://github.com/ZhangYangyi03/autoforge.git@d53d3c5fa4dd617bb65857c390c0ac03edcb533e",
 ]
 
 [project.optional-dependencies]

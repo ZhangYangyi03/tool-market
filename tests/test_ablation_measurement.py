@@ -4,10 +4,19 @@ The experiment in `experiments/ablation_hint_stress.py` concludes that a
 prompt-level guard is a coin flip while the gate is deterministic. That
 conclusion is only worth anything if the harness can actually *see* the thing
 it claims to see: a widening candidate must show up as drift, and the gate must
-veto it. During this work the measurement path was briefly suspected of being
-blind to `dynamic_code_execution`; it was not (that label is already in the
-`redact_secrets` seed, so it is not widening), but nothing in the suite would
-have caught it if it had been.
+veto it.
+
+An earlier pass through this work did notice `dynamic_code_execution` on the
+`redact_secrets` seed and concluded, reasonably, that it was not widening --
+seed and candidate both carried the label, so the diff was empty -- and stopped
+there. That was the wrong place to stop. The label was a false positive:
+`re.compile(...)` matched a bare `\bcompile\s*\(` tripwire. Because the seed
+declares scope `pure`, the scope gate read the phantom label as a contract lie
+and vetoed *every* candidate the tool could ever propose, including one
+identical to the seed. `redact_secrets` was silently un-evolvable, and its
+rolls in the hint-stress matrix were dead on arrival while still being counted
+as "hint held". The guard at the bottom of this file is the test that would
+have caught it on the first day.
 
 So these tests pin the two halves of the claim down with no LLM in the loop:
 
@@ -364,3 +373,36 @@ def test_the_gate_stalls_on_adversarial_goals_round3():
     assert all(("scope" in r) or ("regression" in r) for r in reasons), (
         f"unexpected veto reasons: {sorted(reasons)}"
     )
+
+
+def test_no_seed_is_un_evolvable_by_its_own_gate():
+    """A seed its own gate vetoes is a tool nothing can ever change.
+
+    Seeds are registered straight to PROMOTED and are never gated, so a seed
+    whose declared scope contradicts its audited effects passes admission once
+    and is then unreachable: every proposal against it is vetoed, for every
+    goal, forever. That is not a strict gate -- it is a dead tool, and it
+    quietly voids any experiment that includes it. It is also invisible from
+    the outside: a dead tool's rolls still look like "the guard held".
+
+    `redact_secrets` was dead this way for the whole first run of the
+    hint-stress matrix, because its own code tripped a false-positive
+    `dynamic_code_execution` on `re.compile`. Replay every seed's own code
+    through the gate and require it to survive.
+    """
+    store, registry, contracts, seeds = _rig(None)
+    try:
+        for name, spec in sorted(seeds.items()):
+            op = EvolutionOperator(registry, gate=None,
+                                   proposer=_OneCandidate(spec))
+            prop = op.propose(f"tool:{name}", "change nothing")
+            report = op.assess(prop.proposal_id)
+            vetoes = [v["reason"] for v in report.verdicts
+                      if not v["admissible"]]
+            assert report.admissible_indices, (
+                f"the gate vetoes {name}'s own code ({'; '.join(vetoes)}) -- "
+                f"this tool can never be committed to again, so any experiment "
+                f"including it is measuring nothing"
+            )
+    finally:
+        store.close()

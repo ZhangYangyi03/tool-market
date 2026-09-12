@@ -12,4 +12,5 @@ dist/
 experiments/results/_cache/
 experiments/results/_dbg*/
 experiments/results/_sanity/
+experiments/results/_replay*/
 *.log
