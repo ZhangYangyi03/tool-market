@@ -6,10 +6,20 @@ today. A pin that silently resolves to something else is worse than no pin: the
 reproduction instructions would appear to work while measuring a different
 engine.
 
-This is a CI check rather than a test because a local dev checkout installs the
-engine editable from the sibling directory (see the README quickstart), which
-has no recorded VCS origin to compare against. In CI the engine always arrives
-from GitHub through the pin, so the comparison is meaningful there.
+Three outcomes, and the distinction between them is the point:
+
+  0  the installed engine is the pinned commit
+  1  it is a *different* commit -- a red build
+  2  it records no VCS origin, so the question cannot be answered
+
+Outcome 2 is normal for a developer, who installs the engine editable from the
+sibling checkout (see the README quickstart) and has no recorded origin to
+compare. In CI the engine always arrives from GitHub through the pin, so 2 there
+means something is genuinely wrong -- which is why the workflow treats any
+non-zero exit as a failure, and the message, not the exit code, is what tells a
+human which of the two they are looking at.
+
+Run from the repository root: python tools/check_pinned_engine.py
 """
 
 from __future__ import annotations
@@ -18,9 +28,42 @@ import json
 import pathlib
 import re
 import sys
-from importlib.metadata import PackageNotFoundError, distribution
 
 PIN = re.compile(r"autoforge\s*@\s*git\+[^@]+@([0-9a-f]{40})")
+
+
+def classify(declared: str, direct_url: dict | None) -> tuple[int, str]:
+    """Decide the verdict from the pinned commit and the recorded origin.
+
+    `direct_url` is the parsed `direct_url.json` of the installed distribution,
+    or None when it records none at all. Split out from the environment probe so
+    the decision can be tested without a pip install.
+    """
+    if direct_url is None:
+        return 2, (
+            "autoforge records no origin -- it was installed from a local path "
+            "and this check cannot tell you which commit you have"
+        )
+
+    resolved = (direct_url.get("vcs_info") or {}).get("commit_id")
+    if resolved is None:
+        # An editable local install is the common case here. Say so plainly
+        # rather than reporting a mismatch that has not been established: a
+        # check that cries wolf on the normal developer path is a check that
+        # gets ignored.
+        return 2, (
+            f"installed from {direct_url.get('url')} with no VCS origin -- this "
+            "check cannot tell you which commit you have"
+        )
+
+    if resolved != declared:
+        return 1, (
+            f"FATAL: the installed engine is {resolved}, but pyproject.toml "
+            f"pins {declared}. The reproduction would be measuring a different "
+            "engine."
+        )
+
+    return 0, f"ok: the installed engine is the pinned commit ({declared})"
 
 
 def main() -> int:
@@ -38,35 +81,23 @@ def main() -> int:
     # Ask the installed metadata where this engine came from, rather than
     # guessing at a path: site-packages is outside the repo, so a glob from the
     # working directory would silently find nothing.
+    from importlib.metadata import PackageNotFoundError, distribution
+
     try:
         raw = distribution("autoforge").read_text("direct_url.json")
     except PackageNotFoundError:
         print("autoforge is not installed", file=sys.stderr)
         return 2
-    if not raw:
-        print(
-            "autoforge is installed but records no VCS origin -- it came from a "
-            "local path, so this check cannot tell you which commit you have.",
-            file=sys.stderr,
-        )
-        return 2
 
-    direct_url = json.loads(raw)
-    resolved = (direct_url.get("vcs_info") or {}).get("commit_id")
+    direct_url = json.loads(raw) if raw else None
+    code, message = classify(declared, direct_url)
+
     print(f"pinned   {declared}")
-    print(f"resolved {resolved}")
-    print(f"source   {direct_url.get('url')}")
-
-    if resolved != declared:
-        print(
-            "\nFATAL: the installed engine is not the pinned commit. The "
-            "reproduction below would be measuring a different engine.",
-            file=sys.stderr,
-        )
-        return 1
-
-    print("\nok: the installed engine is the pinned commit")
-    return 0
+    print(f"resolved {(direct_url or {}).get('vcs_info', {}).get('commit_id') if direct_url else None}")
+    print(f"source   {(direct_url or {}).get('url')}")
+    print()
+    print(message, file=sys.stderr if code else sys.stdout)
+    return code
 
 
 if __name__ == "__main__":
