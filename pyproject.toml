@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tool-market"
+version = "0.1.0"
+description = "A protocol-registered resource platform for evolvable agent tools. The enforced implementation of the AGP resource substrate, backed by autoforge."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Zhang Yangyi" }]
+keywords = ["agents", "tools", "protocol", "agp", "lifecycle", "provenance"]
+dependencies = [
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+api = ["fastapi>=0.110", "uvicorn>=0.27"]
+dev = ["pytest>=7.0", "httpx>=0.27"]
+
+[tool.setuptools.packages.find]
+include = ["toolmarket*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

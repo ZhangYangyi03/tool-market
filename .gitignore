@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+build/
+dist/
+
+# Experiment scratch. The evidence that matters (the JSON / CSV / PNG under
+# experiments/results/) IS tracked on purpose; these are the disposable parts.
+experiments/results/_cache/
+experiments/results/_dbg*/
+experiments/results/_sanity/
+*.log
