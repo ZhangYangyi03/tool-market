@@ -258,7 +258,7 @@ python -u experiments/ablation_gate.py --generations 8 --arms A,B,C   # Round 1
 python -u experiments/ablation_adversarial.py --arms A,C             # Round 3
 python -u experiments/ablation_hint_stress.py --rolls 5              # Round 2
 python -u experiments/replay_pool.py                                 # pool audit
-python -m pytest -q                                                  # 33 tests
+python -m pytest -q                                                  # 34 tests
 
 # Round 1 arm C, repeated live (the 6-of-6 claim):
 for i in 1 2 3 4 5; do
@@ -266,6 +266,10 @@ for i in 1 2 3 4 5; do
     --out "experiments/results/stress_c/run$i"
 done
 ```
+
+`tools/check_pinned_engine.py` asserts that the engine pip actually installed is the commit `pyproject.toml` pins. A pin that quietly resolves somewhere else is worse than no pin — the reproduction would appear to work while measuring a different engine.
+
+All of the above also runs on every push in GitHub Actions (`.github/workflows/reproduce.yml`), on Python 3.10, 3.11 and 3.12, so these numbers get re-checked without a machine of the author's being involved.
 
 The tests in `tests/test_ablation_measurement.py` keep the *measurement* honest
 rather than the gate: one asserts that an ungated widening is actually visible
@@ -277,6 +281,8 @@ doubt: that the six repeat runs really were uncached and really did hold, and
 that Round 3's stall (16/16 vetoed, 0 committed) is what the records say. If the
 first ever breaks, the experiment would report "intact" for every arm and
 quietly become worthless — so these are red tests, not charts.
+
+A seventh guards the seeds rather than the numbers: every seed must clear its own gate, because a seed the gate vetoes is a tool no goal can ever change — which is how the `re.compile` false positive under Round 2 stayed invisible through a whole run.
 
 ---
 
@@ -294,7 +300,7 @@ pip install -e ../autoforge     # the enforcement engine
 pip install -e .                # this substrate
 
 python examples/demo_evolution.py      # end-to-end, incl. a veto you can see
-python -m pytest -q                    # 33 tests
+python -m pytest -q                    # 34 tests
 ```
 
 ### API
@@ -351,6 +357,8 @@ tests/
   test_protocol.py           # lifecycle, ledger, lineage, API
   test_gate_determinism.py   # one unsafe candidate -> one verdict, 200 times
   test_ablation_measurement.py  # measurement integrity + README-vs-records
+tools/check_pinned_engine.py    # fails the build if the pin resolved elsewhere
+.github/workflows/reproduce.yml # the whole reproduction, on every push
 ```
 
 ## Design rules
