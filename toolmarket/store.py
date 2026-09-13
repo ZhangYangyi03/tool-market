@@ -16,6 +16,7 @@ Two facts about the schema that matter:
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -60,6 +61,29 @@ class ResourceStore:
 
     def close(self) -> None:
         self._conn.close()
+
+    def ping(self) -> bool:
+        """Liveness probe for the store itself — `/health` reports it.
+
+        SQLite has no server to fail independently, so this is nearly always
+        true; it exists so the health check does not have to special-case which
+        backend is wired in. A closed connection is the case it catches.
+        """
+        try:
+            self._conn.execute("SELECT 1").fetchone()
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def wait_ready(self, attempts: int = 1, delay: float = 0.0) -> None:
+        """No-op: a file-backed SQLite is ready the moment it opens.
+
+        Present so callers can write one startup path against either backend
+        instead of branching on the store type — which is the whole reason
+        Postgres could be dropped in without touching the registry.
+        """
+        if not self.ping():
+            raise RuntimeError(f"sqlite store at {self.path!r} is not usable")
 
     def __enter__(self) -> "ResourceStore":
         return self
@@ -142,4 +166,46 @@ class ResourceStore:
         n_ev = self._conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
         n_ln = self._conn.execute("SELECT COUNT(*) FROM lineage").fetchone()[0]
         return {"resources": n_res, "events": n_ev, "lineage_nodes": n_ln,
-                "path": self.path}
+                "backend": "sqlite", "path": self.path}
+
+
+def make_store(url: Optional[str] = None) -> Any:
+    """Pick a backend from a URL, so the choice is configuration and not code.
+
+    Accepted:
+
+        (unset) / ""        -> ResourceStore(":memory:")   in-process, disposable
+        ":memory:"          -> same
+        "sqlite:///path"    -> ResourceStore("path")
+        "postgres://..."    -> PostgresStore(...)
+        "postgresql://..."  -> PostgresStore(...)
+
+    The URL is read from `url`, else `TOOLMARKET_STORE`, else `DATABASE_URL`
+    (the name every PaaS injects when you attach a database, so a deploy needs
+    no bespoke variable to pick up the database it was given).
+
+    Resolution lives here rather than in the registry because the registry must
+    not know which backends exist — otherwise adding one means editing the
+    protocol layer, and that is exactly the coupling the store boundary is for.
+    Importing `store_pg` is deferred to the Postgres branch so a machine without
+    psycopg2 never touches it.
+    """
+    raw = (url or os.environ.get("TOOLMARKET_STORE")
+           or os.environ.get("DATABASE_URL") or "").strip()
+    if not raw or raw == ":memory:":
+        return ResourceStore(":memory:")
+    if raw.startswith(("postgres://", "postgresql://")):
+        from toolmarket.store_pg import PostgresStore
+
+        store = PostgresStore(raw)
+        store.wait_ready(attempts=30, delay=1.0)
+        return store
+    if raw.startswith("sqlite://"):
+        # sqlite:///abs/path -> /abs/path ; sqlite:///:memory: -> :memory:
+        rest = raw[len("sqlite://"):]
+        if rest.startswith("/") and not rest.startswith("//"):
+            return ResourceStore(rest)
+        return ResourceStore(rest.lstrip("/") or ":memory:")
+    # Anything else is treated as a filesystem path -- the CLI's documented way
+    # of asking for a durable substrate without standing up a server.
+    return ResourceStore(raw)

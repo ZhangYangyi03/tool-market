@@ -308,7 +308,29 @@ def build_app(registry: Optional[ResourceRegistry] = None,
         return {"ok": True, "resources": len(reg.list()),
                 "events": len(reg.log), "chain_ok": reg.log.verify_chain()}
 
+    @app.get("/metrics")
+    def metrics_endpoint() -> Any:
+        """The same exposition the API serves, reachable from the console's root.
+
+        Duplicated here rather than proxied through `/api/metrics` so a scraper
+        pointed at either process gets the same answer without knowing which is
+        which. It reads the process-local registry, so scraping the console
+        reports the console's counters — not the API's, which is the correct and
+        only meaningful thing it could report.
+        """
+        from fastapi.responses import Response
+
+        from toolmarket import metrics as _metrics
+        return Response(content=_metrics.render(),
+                        media_type="text/plain; version=0.0.4; charset=utf-8")
+
     # Mount the substrate's own app under /api, so its routes stay exactly as
     # they are and the page has a namespace of its own.
     app.mount("/api", api)
-    return app
+
+    # Wrap last, so the middleware sees every request that reaches either the
+    # page or the API — including the ones the page's own fetches make, which is
+    # what makes the dashboard's latency panels say anything true.
+    from toolmarket.ratelimit import install
+
+    return install(app)

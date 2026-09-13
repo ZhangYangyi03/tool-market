@@ -14,3 +14,11 @@ experiments/results/_dbg*/
 experiments/results/_sanity/
 experiments/results/_replay*/
 *.log
+
+# Deployment credentials. Read by deploy/huggingface/deploy.py; must never be
+# committed. `*.env` rather than just this file because the natural mistake is
+# to make a `.env.staging` and assume the ignore rule already covers it.
+.deploy.env
+.env
+*.env
+!.env.example

@@ -1,0 +1,269 @@
+"""PostgreSQL persistence — the same three tables, a different engine.
+
+`store.py` says the store is deliberately dumb and that "a different backend
+(Postgres, a file tree, an object store) can replace this without touching
+anything above it". This module is that claim tested rather than asserted: it
+implements the *same duck-typed surface* as `ResourceStore` and nothing above
+the store changes. `ResourceRegistry` cannot tell the two apart, which is why
+there is no interface to extract — the interface was always the method names.
+
+Three differences from the SQLite store are deliberate:
+
+  * `json` columns are **JSONB**, not TEXT. The substrate's records are queried,
+    not just fetched (which resources are ACTIVE, which events belong to a
+    resource), and JSONB makes that a database question instead of a Python one.
+  * `append_event` is `ON CONFLICT DO NOTHING`, not `DO UPDATE`. The event log is
+    append-only by contract; an "insert" that could rewrite an existing seq
+    would be a silent tamper path, and `verify_chain` would then be verifying
+    something nobody promised. A duplicate seq is a no-op, never a rewrite.
+  * `stats()["path"]` returns a **redacted DSN**. The SQLite store returns a file
+    path because a file path cannot hold a password. A DSN can, and this dict is
+    reachable from `GET /stats` — so the password is stripped here rather than
+    left to every caller to remember.
+
+Connections come from a `ThreadedConnectionPool`: the API serves requests on a
+threadpool and the Celery worker runs in another process entirely, so a single
+shared connection with a lock would serialize both against each other.
+"""
+from __future__ import annotations
+
+import json
+import time
+from contextlib import contextmanager
+from typing import Any, Iterator, Optional
+from urllib.parse import urlsplit, urlunsplit
+
+from toolmarket.protocol.events import Event, EventLog
+from toolmarket.protocol.lineage import LineageGraph, LineageNode
+from toolmarket.protocol.resources import ResourceRecord
+
+try:  # psycopg2 is an optional extra; import failure is reported at construction
+    import psycopg2
+    from psycopg2 import pool as _pg_pool
+    _HAVE_PG = True
+    _PG_ERR: Optional[BaseException] = None
+except Exception as _exc:  # noqa: BLE001
+    psycopg2 = None  # type: ignore[assignment]
+    _pg_pool = None  # type: ignore[assignment]
+    _HAVE_PG = False
+    _PG_ERR = _exc
+
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS resources (
+    id          TEXT PRIMARY KEY,
+    json        JSONB NOT NULL,
+    updated_at  DOUBLE PRECISION NOT NULL
+);
+CREATE TABLE IF NOT EXISTS events (
+    seq          INTEGER PRIMARY KEY,
+    resource_id  TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    json         JSONB NOT NULL,
+    at           DOUBLE PRECISION NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_resource ON events(resource_id);
+CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);
+CREATE TABLE IF NOT EXISTS lineage (
+    node_id      TEXT PRIMARY KEY,
+    resource_id  TEXT NOT NULL,
+    json         JSONB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lineage_resource ON lineage(resource_id);
+"""
+
+
+def redact_dsn(dsn: str) -> str:
+    """A DSN safe to put in an HTTP response: credentials removed, rest kept.
+
+    Kept public and separate because it is the kind of thing that gets
+    re-implemented inline, badly, the second time somebody adds a health field.
+    """
+    try:
+        parts = urlsplit(dsn)
+    except Exception:  # noqa: BLE001
+        return "<unparseable dsn>"
+    if not parts.netloc:
+        return dsn
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    return urlunsplit((parts.scheme, host, parts.path, parts.query, ""))
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    """A JSONB column arrives already decoded; TEXT arrives as a string.
+
+    Both are accepted so the same code path works against either column type —
+    and so a store written by an older revision (TEXT) still loads.
+    """
+    if isinstance(value, (dict, list)):
+        return value  # type: ignore[return-value]
+    return json.loads(value)
+
+
+class PostgresStore:
+    """The SQLite store's surface, on PostgreSQL. `dsn` like
+    `postgresql://user:pw@host:5432/db`."""
+
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        minconn: int = 1,
+        maxconn: int = 8,
+        connect_timeout: int = 5,
+    ) -> None:
+        if not _HAVE_PG:
+            raise RuntimeError(
+                "PostgresStore needs psycopg2, which failed to import: "
+                f"{_PG_ERR!r}. Install the extra: pip install 'tool-market[postgres]'"
+            )
+        self.dsn = dsn
+        self._pool = _pg_pool.ThreadedConnectionPool(
+            minconn, maxconn, dsn=dsn, connect_timeout=connect_timeout
+        )
+        self._init_schema()
+
+    # -- plumbing ----------------------------------------------------------
+    @contextmanager
+    def _cursor(self, *, commit: bool = False) -> Iterator[Any]:
+        conn = self._pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                yield cur
+            if commit:
+                conn.commit()
+            else:
+                conn.rollback()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._pool.putconn(conn)
+
+    def _init_schema(self) -> None:
+        with self._cursor(commit=True) as cur:
+            cur.execute(_SCHEMA)
+
+    def wait_ready(self, attempts: int = 30, delay: float = 1.0) -> None:
+        """Block until the server accepts a trivial query.
+
+        `depends_on: condition: service_healthy` covers the compose case, but a
+        locally-run `uvicorn` against a just-started container hits this window
+        constantly. Retrying here means the failure mode is a slow start rather
+        than a traceback the reader has to decode.
+        """
+        last: Optional[BaseException] = None
+        for _ in range(max(1, attempts)):
+            try:
+                with self._cursor() as cur:
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+                return
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                time.sleep(delay)
+        raise RuntimeError(f"postgres never became ready: {last!r}") from last
+
+    def ping(self) -> bool:
+        try:
+            with self._cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def close(self) -> None:
+        self._pool.closeall()
+
+    def __enter__(self) -> "PostgresStore":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    # -- resources --------------------------------------------------------
+    def save_resource(self, rec: ResourceRecord) -> None:
+        payload = json.dumps(rec.to_dict(), default=str)
+        with self._cursor(commit=True) as cur:
+            cur.execute(
+                "INSERT INTO resources(id, json, updated_at) VALUES(%s, %s::jsonb, %s) "
+                "ON CONFLICT(id) DO UPDATE SET json=EXCLUDED.json, "
+                "updated_at=EXCLUDED.updated_at",
+                (rec.id, payload, time.time()),
+            )
+
+    def load_resource(self, resource_id: str) -> Optional[ResourceRecord]:
+        with self._cursor() as cur:
+            cur.execute("SELECT json FROM resources WHERE id=%s", (resource_id,))
+            row = cur.fetchone()
+        return ResourceRecord.from_dict(_as_dict(row[0])) if row else None
+
+    def load_resources(self) -> list[ResourceRecord]:
+        with self._cursor() as cur:
+            cur.execute("SELECT json FROM resources ORDER BY updated_at")
+            rows = cur.fetchall()
+        return [ResourceRecord.from_dict(_as_dict(r[0])) for r in rows]
+
+    # -- events -----------------------------------------------------------
+    def append_event(self, event: Event) -> None:
+        with self._cursor(commit=True) as cur:
+            cur.execute(
+                "INSERT INTO events(seq, resource_id, kind, json, at) "
+                "VALUES(%s, %s, %s, %s::jsonb, %s) ON CONFLICT(seq) DO NOTHING",
+                (event.seq, event.resource_id, event.kind.value,
+                 json.dumps(event.to_dict(), default=str), event.at),
+            )
+
+    def load_events(self) -> EventLog:
+        with self._cursor() as cur:
+            cur.execute("SELECT json FROM events ORDER BY seq")
+            rows = cur.fetchall()
+        return EventLog([Event.from_dict(_as_dict(r[0])) for r in rows])
+
+    # -- lineage ----------------------------------------------------------
+    def save_lineage_node(self, node: LineageNode) -> None:
+        with self._cursor(commit=True) as cur:
+            cur.execute(
+                "INSERT INTO lineage(node_id, resource_id, json) "
+                "VALUES(%s, %s, %s::jsonb) "
+                "ON CONFLICT(node_id) DO UPDATE SET json=EXCLUDED.json",
+                (node.node_id, node.resource_id,
+                 json.dumps(node.to_dict(), default=str)),
+            )
+
+    def load_lineage(self) -> LineageGraph:
+        with self._cursor() as cur:
+            cur.execute("SELECT json FROM lineage")
+            rows = cur.fetchall()
+        graph = LineageGraph()
+        # Insert parents-first so add() validation passes regardless of order;
+        # orphans are force-added so a partial store still loads (same policy as
+        # the SQLite store — the two must not disagree about what "loadable" is).
+        pending = [LineageNode(**_as_dict(r[0])) for r in rows]
+        while pending:
+            progressed = False
+            for node in list(pending):
+                if all(p in graph for p in node.parents):
+                    graph.add(node)
+                    pending.remove(node)
+                    progressed = True
+            if not progressed:
+                for node in pending:
+                    graph._nodes[node.node_id] = node  # noqa: SLF001
+                break
+        return graph
+
+    # -- aggregate --------------------------------------------------------
+    def stats(self) -> dict[str, Any]:
+        with self._cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM resources")
+            n_res = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM events")
+            n_ev = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM lineage")
+            n_ln = cur.fetchone()[0]
+        return {"resources": n_res, "events": n_ev, "lineage_nodes": n_ln,
+                "backend": "postgres", "path": redact_dsn(self.dsn)}

@@ -58,9 +58,9 @@ class ResourceRegistry:
         log: Optional[EventLog] = None,
         lineage: Optional[LineageGraph] = None,
     ) -> None:
-        from toolmarket.store import ResourceStore
+        from toolmarket.store import make_store
 
-        self.store = store if store is not None else ResourceStore()
+        self.store = store if store is not None else make_store()
         # Adopt autoforge's registry so the *same* enforcement object runs on
         # live calls; we never run a second, weaker copy.
         self.tools = tool_registry
@@ -105,6 +105,31 @@ class ResourceRegistry:
         rec.updated_at = time.time()
         self._records[rec.id] = rec
         self.store.save_resource(rec)
+        self._invalidate(rec.id)
+
+    def _invalidate(self, resource_id: str) -> None:
+        """Drop the cached view of one resource.
+
+        Called from `save` and nowhere else, because `save` is the only method
+        that changes a record — including when the caller is the Celery worker
+        in a different process, which is the case this has to work for. With a
+        shared Redis, a worker's commit invalidates the API's cache entry even
+        though the two share no memory; that property is why invalidation lives
+        at the write rather than in the API's route handlers, where it would look
+        like it worked in tests and silently not in production.
+
+        Best-effort by design: an unreachable cache must never turn a successful
+        write into a failed one. The cost of failing here is a stale read for
+        one TTL; the cost of raising is a registry that cannot persist.
+        """
+        try:
+            from toolmarket import metrics as _metrics
+            from toolmarket.cache import get_cache, resource_key
+
+            get_cache().delete(resource_key(resource_id))
+            _metrics.STORE_OPERATIONS.inc(operation="save_resource")
+        except Exception:  # noqa: BLE001 - see docstring
+            pass
 
     def register(self, spec_or_record: Any, *, actor: str = "system",
                  state: Optional[ResourceState] = None) -> ResourceRecord:

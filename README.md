@@ -300,28 +300,121 @@ pip install -e ../autoforge     # the enforcement engine
 pip install -e .                # this substrate
 
 python examples/demo_evolution.py      # end-to-end, incl. a veto you can see
-python -m pytest -q                    # 34 tests
+python -m pytest -q                    # 142 collected; 10 skip without Postgres
+```
+
+The whole stack — API, worker, database, cache, and optionally Prometheus and
+Grafana — is one command:
+
+```bash
+docker compose up -d                              # api + worker + postgres + redis
+docker compose --profile observability up -d      # + prometheus + grafana
+./deploy/smoke.sh                                 # walks a resource through its whole life
 ```
 
 ### API
 
 ```bash
+# Bare substrate: routes only.
 python -m uvicorn --factory toolmarket.api.main:create_app --port 8777
+
+# As a deployment serves it: routes + rate limiter + metrics middleware. This is
+# what the container runs; `/metrics` reports nothing useful about traffic if the
+# request path does not go through the middleware.
+python -m uvicorn toolmarket.api.main:served_app --port 8777
 ```
 
 | Method | Path | Meaning |
 |---|---|---|
-| `GET`  | `/health` | liveness + chain status |
+| `GET`  | `/` | index: name, version, the route list |
+| `GET`  | `/health` | liveness — process-local, touches no dependency, plus chain status |
+| `GET`  | `/ready` | readiness — store and cache probed separately; `503` names the failure |
+| `GET`  | `/metrics` | Prometheus exposition (`text/plain; version=0.0.4`) |
 | `GET`  | `/resources` | list (`?type=`, `?state=`) |
 | `POST` | `/resources` | register a tool → `draft` |
-| `GET`  | `/resources/{id}` | the full record, incl. capability schema |
+| `GET`  | `/resources/{id}` | the full record, incl. capability schema (`?fresh=true` bypasses the cache) |
 | `POST` | `/resources/{id}/transition` | lifecycle move (`409` if illegal) |
 | `POST` | `/resources/{id}/invoke` | call it (ledger + event recorded) |
-| `POST` | `/resources/{id}/evolve` | run the closed loop (`{"goal": …, "commit": true}`) |
+| `POST` | `/resources/{id}/evolve` | run the closed loop, synchronously (`{"goal": …, "commit": true}`) |
+| `POST` | `/resources/{id}/evolve/async` | enqueue the same loop → `202` + a task id |
+| `GET`  | `/tasks/{id}` | poll one queued evolution: state, stage, progress, terminal |
 | `GET`  | `/resources/{id}/lineage` | the DAG around a resource |
 | `GET`  | `/resources/{id}/events` | that resource's audit trail |
 | `GET`  | `/events` | the global append-only log |
 | `GET`  | `/stats` | substrate counters |
+
+## Deployment
+
+Three shapes, in increasing order of what they cost and what they prove. All
+three run **the same image**; what differs is which backends are configured, and
+every backend is chosen by an environment variable the code reads at startup
+(`TOOLMARKET_STORE`, `REDIS_URL`, `TASK_QUEUE`).
+
+### 1. One command, no dependencies
+
+    docker run --rm -p 8000:8000 ghcr.io/<owner>/tool-market
+
+In-memory store, in-process cache, inline queue. This is the configuration CI
+smoke-tests on every push, and it is the honest default: it starts, it serves,
+and it forgets everything on exit.
+
+### 2. The full stack (`docker compose up -d`)
+
+Four services. What each one changes about behaviour — not just about
+architecture:
+
+| Service | Without it | With it |
+|---|---|---|
+| **postgres** | the substrate lives in one process's memory | resources, events and lineage survive a restart, and the API and the worker share one substrate. This is what makes the async path correct rather than merely concurrent |
+| **redis** | cached reads are process-local; the rate limiter counts per process | `GET /resources/{id}` is cached across replicas, the limiter's window is shared, and task records outlive a restart |
+| **worker** (Celery) | `POST /evolve/async` runs on a thread of the API process — real concurrency, no durability | evolutions survive an API restart, and a restart cannot lose an accepted task |
+| **prometheus + grafana** (`--profile observability`) | `/metrics` is a URL you curl | the live dashboard, 6 alerts, and the latency/cache/queue history that makes the rest of this checkable |
+
+    ./deploy/smoke.sh     # 20 assertions across the whole documented surface
+    make verify           # the live Postgres suite, against the running stack
+
+The observability services are behind a profile on purpose. On a laptop with
+3 GB free, `up` has to mean *the thing that runs*, and a compose file that forces
+a monitoring stack on every `up` is a compose file people stop running.
+
+### 3. A public URL
+
+**HuggingFace Spaces** — the live deployment, no credit card:
+
+    python deploy/huggingface/deploy.py     # reads .deploy.env, pushes, verifies
+
+The Space is the single-process configuration from above, and
+`deploy/huggingface/deploy.py` polls the runtime until it is `RUNNING`, then
+curls `/health`, `/ready` and `/metrics`. "The build succeeded" and "the service
+answers" are different claims and only the second one is worth reporting.
+
+**Render** — the one with a real database behind it:
+
+    make render-init     # copies deploy/render/render.yaml to the repo root
+    # then: render.com -> New -> Blueprint -> this repo
+
+`render.yaml` provisions a web service, a Postgres and a Redis. Two facts about
+the free plan, stated here rather than discovered later: Postgres expires after
+90 days, and the web service spins down after 15 minutes idle. `TRUST_PROXY=1` is
+set there for a reason worth knowing — Render terminates TLS in front of the
+container, so without it the limiter would see every request as coming from the
+proxy and apply one global budget instead of a per-client one.
+
+### Configuration
+
+| Variable | Default | Effect |
+|---|---|---|
+| `TOOLMARKET_STORE` | `:memory:` | `postgresql://…` for a durable, shared substrate; `sqlite:///path` or a bare path for a durable single-process one |
+| `REDIS_URL` | unset → in-process | `redis://host:port/db` for a shared cache; `none` for no cache at all |
+| `TASK_QUEUE` | `inline` | `celery` to hand evolutions to a worker |
+| `CACHE_TTL` | `30` | seconds; `0` disables read caching |
+| `RATE_LIMIT` / `RATE_LIMIT_WINDOW` | `120` / `60` | requests per window, per client and per route prefix |
+| `TRUST_PROXY` | unset | set to `1` **only** behind a proxy you control; otherwise a client picks its own rate-limit bucket by setting a header |
+
+`REDIS_URL=none` is worth a warning rather than a table row: task records live in
+the cache, so with no cache `POST /evolve/async` returns a task id that
+immediately 404s. The unset default is the in-process cache precisely so a
+container that was started with no configuration at all still keeps its promises.
 
 ### Data model
 
@@ -359,6 +452,20 @@ tests/
   test_ablation_measurement.py  # measurement integrity + README-vs-records
 tools/check_pinned_engine.py    # fails the build if the pin resolved elsewhere
 .github/workflows/reproduce.yml # the whole reproduction, on every push
+.github/workflows/ci.yml        # tests, the image, the dashboard, the smoke test
+Dockerfile, docker-compose.yml  # the runtime image and the four-service stack
+deploy/
+  smoke.sh                  # 20 assertions against a running stack
+  prometheus/               # scrape config + 6 alert rules
+  grafana/                  # provisioned datasource + the substrate dashboard
+  huggingface/              # the public Space: card, and the deploy script
+  render/render.yaml        # Blueprint: web + Postgres + Redis
+tests/test_serve.py             # the served surface: probes, cache, async API
+tests/test_cache.py             # three cache backends, and their degradations
+tests/test_ratelimit.py         # limiting and instrumentation, over real ASGI
+tests/test_metrics.py           # the exposition format, and how it breaks scrapes
+tests/test_tasks.py             # task records, the inline queue, the failure path
+tests/test_store_pg.py          # the Postgres backend, incl. a live suite
 ```
 
 ## Design rules

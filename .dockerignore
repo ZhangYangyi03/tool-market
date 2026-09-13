@@ -1,0 +1,44 @@
+# What the image build must not see.
+#
+# The rule is not "exclude junk" but "the image must be a function of tracked
+# source and nothing else". Every entry here is something that exists on a
+# developer's disk and would make a locally-built image differ from one built in
+# CI from a clean clone — which is the failure where "it works on my machine"
+# becomes "the image is not reproducible".
+
+.git
+.gitattributes
+.github
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Credentials. The image must never contain them, and COPY is not a place to
+# rely on a .gitignore.
+.deploy.env
+.env
+*.env
+!deploy/env.example
+
+# Python build artefacts
+__pycache__
+*.py[cod]
+*.egg-info
+build
+dist
+.venv
+venv
+
+# Local substrate state and experiment scratch
+*.db
+*.sqlite3
+*.log
+experiments/results/_cache
+experiments/results/_dbg*
+experiments/results/_sanity
+experiments/results/_replay*
+
+# Deployment descriptors are read by the deploy tooling, not by the image
+docker-compose.yml
+deploy/
+docs/
