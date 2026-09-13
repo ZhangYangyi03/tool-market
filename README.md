@@ -379,16 +379,27 @@ a monitoring stack on every `up` is a compose file people stop running.
 
 ### 3. A public URL
 
-**HuggingFace Spaces** — the live deployment, no credit card:
+**Not HuggingFace Spaces, on a free account.** Verified against the API, not
+assumed — `deploy/huggingface/deploy.py` reports it verbatim:
 
-    python deploy/huggingface/deploy.py     # reads .deploy.env, pushes, verifies
+    POST /api/repos/create {"type": "space", "sdk": "docker"|"gradio"}  ->  402
+    "Static Spaces are free for everyone, but hosting Gradio and Docker Spaces on
+     free cpu-basic requires a PRO subscription."
 
-The Space is the single-process configuration from above, and
-`deploy/huggingface/deploy.py` polls the runtime until it is `RUNNING`, then
-curls `/health`, `/ready` and `/metrics`. "The build succeeded" and "the service
-answers" are different claims and only the second one is worth reporting.
+Only Static Spaces — HTML and JavaScript, no server — are free, and a static
+Space cannot run this API. Nothing about the deployment changes that; it is a fact
+about the plan. Both Space modes are still implemented and tested up to that 402,
+and are one command on a PRO account:
 
-**Render** — the one with a real database behind it:
+    python deploy/huggingface/deploy.py                 # gradio: no image build
+    python deploy/huggingface/deploy.py --mode docker   # the canonical image
+
+Both serve the same `create_served_app`; they differ in how the process starts.
+`deploy/huggingface/gradio_app.py` also runs anywhere a Python process runs:
+
+    python deploy/huggingface/gradio_app.py     # then: curl localhost:7860/health
+
+**Render** — the free path with a real database behind it:
 
     make render-init     # copies deploy/render/render.yaml to the repo root
     # then: render.com -> New -> Blueprint -> this repo
@@ -399,6 +410,11 @@ the free plan, stated here rather than discovered later: Postgres expires after
 set there for a reason worth knowing — Render terminates TLS in front of the
 container, so without it the limiter would see every request as coming from the
 proxy and apply one global budget instead of a per-client one.
+
+Which parts of this section are verified: the compose stack, the image, and the
+smoke suite are exercised (locally and in CI). `render.yaml` is declarative and
+has only been reviewed by eye — Render's own schema validation happens on the
+first Blueprint run, and that is where a surprise would surface.
 
 ### Configuration
 
@@ -451,14 +467,17 @@ tests/
   test_gate_determinism.py   # one unsafe candidate -> one verdict, 200 times
   test_ablation_measurement.py  # measurement integrity + README-vs-records
 tools/check_pinned_engine.py    # fails the build if the pin resolved elsewhere
+tools/check_dashboards.py       # the dashboard and alert rules vs the emitted metrics
 .github/workflows/reproduce.yml # the whole reproduction, on every push
 .github/workflows/ci.yml        # tests, the image, the dashboard, the smoke test
 Dockerfile, docker-compose.yml  # the runtime image and the four-service stack
+Makefile                        # the commands somebody actually runs
+.env.example                    # what `docker compose` reads
 deploy/
-  smoke.sh                  # 20 assertions against a running stack
-  prometheus/               # scrape config + 6 alert rules
+  smoke.sh                  # 25 assertions against a running stack
+  prometheus/               # scrape config + 7 alert rules
   grafana/                  # provisioned datasource + the substrate dashboard
-  huggingface/              # the public Space: card, and the deploy script
+  huggingface/              # Space cards, the deploy script, the gradio entrypoint
   render/render.yaml        # Blueprint: web + Postgres + Redis
 tests/test_serve.py             # the served surface: probes, cache, async API
 tests/test_cache.py             # three cache backends, and their degradations

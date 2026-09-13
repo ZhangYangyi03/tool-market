@@ -41,16 +41,41 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ENV_FILE = REPO_ROOT / ".deploy.env"
 
-#: Exactly what the Space gets. Every entry is either needed to build the image
-#: or is the Space's own card. `experiments/`, `tests/`, `deploy/`, `docs/` and
-#: the paper artifacts are deliberately absent: the Space is the API, not the
-#: project.
-PAYLOAD: tuple[str, ...] = (
-    "Dockerfile",
-    "pyproject.toml",
-    "toolmarket",
-)
-CARD = Path(__file__).with_name("README.md")
+#: Two ways to publish, and neither is free. Verified against the API rather than
+#: assumed: creating *either* a Gradio or a Docker Space on a free account fails
+#:
+#:     402: Static Spaces are free for everyone, but hosting Gradio and Docker
+#:     Spaces on free cpu-basic requires a PRO subscription.
+#:
+#: Only Static Spaces (no server) are free, and a static Space cannot run this
+#: API. So the modes below differ in how the process starts and what the Space
+#: builds from — not in what they cost:
+#:
+#:   * `docker` is the canonical artefact: the repository's own Dockerfile, the
+#:     same image `docker compose up` builds and CI smoke-tests.
+#:   * `gradio` skips the image build, which makes it faster and usable on hosts
+#:     without a container runtime. It is the default for that reason.
+#:
+#: Both serve *the same app*: `toolmarket.api.main.create_served_app`, with the
+#: rate limiter and the metrics middleware.
+MODES: dict[str, dict[str, object]] = {
+    "gradio": {
+        "sdk": "gradio",
+        "card": "gradio-README.md",
+        # The Space's `app_file` is `app.py`; the source of truth stays named for
+        # what it is, so the copy is explicit here rather than a rename in git.
+        "copies": {"gradio_app.py": "app.py",
+                   "gradio-requirements.txt": "requirements.txt"},
+        "payload": ("toolmarket",),
+    },
+    "docker": {
+        "sdk": "docker",
+        "card": "README.md",
+        "copies": {},
+        "payload": ("Dockerfile", "pyproject.toml", "toolmarket"),
+    },
+}
+HERE = Path(__file__).resolve().parent
 
 
 def load_env(path: Path = ENV_FILE) -> dict[str, str]:
@@ -96,8 +121,14 @@ def whoami(token: str) -> str:
     return str(body.get("name") or "")
 
 
-def ensure_space(token: str, namespace: str, name: str) -> str:
-    """Create the Space if it does not exist. Returns its repo id."""
+def ensure_space(token: str, namespace: str, name: str, sdk: str) -> str:
+    """Create the Space if it does not exist. Returns its repo id.
+
+    An existing Space is reused whatever its SDK: the frontmatter in the card
+    decides how HuggingFace builds it, and re-creating the repo would discard its
+    history for no reason. A 402 here is the free-account Docker restriction and
+    is reported with the explanation rather than as a bare status code.
+    """
     repo = f"{namespace}/{name}"
     status, body = _api(f"https://huggingface.co/api/spaces/{repo}", token)
     if status == 200:
@@ -110,14 +141,23 @@ def ensure_space(token: str, namespace: str, name: str) -> str:
         "name": name,
         "organization": namespace if namespace else None,
         "private": False,
-        # The SDK is what makes this a Docker Space rather than a Gradio one;
-        # the frontmatter in the card repeats it, and the card wins — this only
-        # decides what the repo is created as.
-        "sdk": "docker",
+        # The SDK is what makes this a Docker or a Gradio Space at creation time;
+        # the frontmatter in the card repeats it, and the card wins thereafter.
+        "sdk": sdk,
     })
     if status not in (200, 201):
+        if status == 402:
+            sys.exit(
+                f"could not create space {repo}: HuggingFace declined ({status}).\n"
+                f"  {body}\n"
+                "  Both Gradio and Docker Spaces need a PRO subscription on\n"
+                "  cpu-basic; only Static Spaces (no server) are free, and a\n"
+                "  Static Space cannot run this API. Nothing about `--mode`\n"
+                "  changes that. The free paths are `docker compose up` locally\n"
+                "  and the Render blueprint (see deploy/render/render.yaml)."
+            )
         sys.exit(f"could not create space {repo}: {status} {body}")
-    print(f"created space {repo}")
+    print(f"created space {repo} (sdk={sdk})")
     return repo
 
 
@@ -129,8 +169,9 @@ def _run(args: list[str], cwd: Path) -> None:
         sys.exit(f"{' '.join(args[:2])} failed:\n{stderr}")
 
 
-def assemble(work: Path) -> None:
-    for entry in PAYLOAD:
+def assemble(work: Path, mode: str) -> None:
+    spec = MODES[mode]
+    for entry in spec["payload"]:  # type: ignore[union-attr]
         src = REPO_ROOT / entry
         dst = work / entry
         if src.is_dir():
@@ -138,7 +179,9 @@ def assemble(work: Path) -> None:
                 "__pycache__", "*.pyc", ".pytest_cache"))
         else:
             shutil.copy2(src, dst)
-    shutil.copy2(CARD, work / "README.md")
+    for src_name, dst_name in (spec["copies"] or {}).items():  # type: ignore[union-attr]
+        shutil.copy2(HERE / src_name, work / dst_name)
+    shutil.copy2(HERE / str(spec["card"]), work / "README.md")
     # A Space-local .dockerignore. Written rather than copied because the repo's
     # version excludes `deploy/` and the paper directories that are not in the
     # Space in the first place, and an ignore file listing files that do not
@@ -215,6 +258,8 @@ def tail_logs(token: str, repo: str, kind: str = "build", lines: int = 40) -> No
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--name", default="toolmarket")
+    ap.add_argument("--mode", choices=sorted(MODES), default="gradio",
+                    help="gradio (free) or docker (needs a PRO account)")
     ap.add_argument("--namespace", default=None,
                     help="HF user or org; defaults to the token's own account")
     ap.add_argument("--no-wait", action="store_true")
@@ -226,13 +271,13 @@ def main() -> int:
     if not token:
         sys.exit(".deploy.env has no HF_TOKEN")
     namespace = args.namespace or env.get("HF_NAMESPACE") or whoami(token)
-    print(f"publishing as {namespace}/{args.name}")
+    print(f"publishing as {namespace}/{args.name} (mode={args.mode})")
 
-    repo = ensure_space(token, namespace, args.name)
+    repo = ensure_space(token, namespace, args.name, str(MODES[args.mode]["sdk"]))
 
     work = Path(tempfile.mkdtemp(prefix="hf-space-"))
     try:
-        assemble(work)
+        assemble(work, args.mode)
         push(work, repo, token)
     finally:
         if args.keep_workdir:
@@ -256,18 +301,23 @@ def main() -> int:
     # endpoint is process-local and touches no dependency, so it is the honest
     # signal that the container is up; /ready and /metrics are checked because a
     # Space that 500s on either is a Space whose instrumentation is broken.
-    base = f"https://{repo.split('/')[0]}-{args.name}.hf.space"
+    #
+    # The hostname is the Space's *subdomain* form; the embed form is different
+    # and returns the UI shell rather than the API, which is why this is spelled
+    # out instead of derived from the page URL.
+    slug = repo.replace("/", "-").replace("_", "-").replace(".", "-").lower()
+    base = f"https://{slug}.hf.space"
     import urllib.error as _ue
     for path in ("/health", "/ready", "/metrics"):
         try:
-            with urllib.request.urlopen(base + path, timeout=60) as resp:
+            with urllib.request.urlopen(base + path, timeout=90) as resp:
                 body = resp.read(400).decode("utf-8", "replace")
                 print(f"GET {path} -> {resp.status}: {body.splitlines()[0][:120]}")
         except _ue.HTTPError as exc:
             print(f"GET {path} -> {exc.code}")
         except Exception as exc:  # noqa: BLE001
             print(f"GET {path} -> {exc}")
-    print(f"\nlive at {base}\ndocs at {base}/docs\nspace page: {url}")
+    print(f"\nlive at {base}\ndocs at {base}/docs\nui at {base}/ui\nspace page: {url}")
     return 0
 
 

@@ -46,3 +46,11 @@ with Prometheus and Grafana:
 The README in the repo is the source of truth for the deployment story and states
 what each backend changes about behaviour. The short version: this Space loses
 its substrate on rebuild, and that is the only thing it loses.
+
+## Plan requirement, stated plainly
+
+HuggingFace requires a **PRO subscription** to host a Docker (or Gradio) Space on
+free `cpu-basic`; only Static Spaces are free, and a static Space cannot run this
+API. Creating this Space on a free account fails with `402`, which
+`deploy/huggingface/deploy.py` reports verbatim. For a free deployment, use
+`docker compose up` locally or the Render blueprint in `deploy/render/`.

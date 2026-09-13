@@ -7,8 +7,9 @@ COMPOSE ?= docker compose
 IMAGE ?= toolmarket:local
 API_PORT ?= 8000
 
-.PHONY: help install test lint compose-up compose-obs compose-down compose-logs \
-        smoke image psql redis-cli hf-deploy render-init verify clean
+.PHONY: help install test lint check-config compose-up compose-obs compose-down \
+        compose-logs smoke verify image psql redis-cli hf-deploy hf-deploy-docker \
+        render-init clean
 
 help:  ## list targets
 	@grep -E '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sed 's/:.*## /  - /'
@@ -20,7 +21,10 @@ test:  ## the whole suite (no server needed; the Postgres cases skip)
 	$(PY) -m pytest tests -q
 
 lint:  ## the CI lint selection
-	$(PY) -m ruff check --select E9,F63,F7,F82,F821 toolmarket tests
+	$(PY) -m ruff check --select E9,F63,F7,F82,F821 toolmarket tests tools
+
+check-config:  ## validate the prometheus/grafana files (same script CI runs)
+	$(PY) tools/check_dashboards.py
 
 image:  ## build the runtime image
 	docker build --target runtime -t $(IMAGE) .
@@ -55,8 +59,11 @@ verify:  ## the live Postgres suite against the running stack
 smoke:  ## end-to-end against a running stack: health, ready, metrics, async
 	@./deploy/smoke.sh
 
-hf-deploy:  ## publish the API to a HuggingFace Docker Space
-	$(PY) deploy/huggingface/deploy.py
+hf-deploy:  ## publish the API to a HuggingFace Space (gradio mode; free)
+	$(PY) deploy/huggingface/deploy.py --mode gradio
+
+hf-deploy-docker:  ## publish the Dockerfile to a Space (needs a PRO account)
+	$(PY) deploy/huggingface/deploy.py --mode docker
 
 render-init:  ## copy the Render blueprint to the repo root (Render reads it there)
 	cp deploy/render/render.yaml render.yaml

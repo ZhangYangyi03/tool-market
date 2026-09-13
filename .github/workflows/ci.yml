@@ -117,56 +117,11 @@ jobs:
       - name: grafana provisioning + dashboard
         run: |
           pip install pyyaml
-          python - <<'PY'
-          import json, pathlib, sys, yaml
-
-          dash = json.loads(pathlib.Path(
-              "deploy/grafana/dashboards/toolmarket.json"
-          ).read_text(encoding="utf-8"))
-          datasources = yaml.safe_load(pathlib.Path(
-              "deploy/grafana/provisioning/datasources/prometheus.yml"
-          ).read_text(encoding="utf-8"))["datasources"]
-          uids = {d["uid"] for d in datasources}
-
-          # The datasource uid is what every panel resolves against. Grafana will
-          # import a dashboard whose panels point at a uid that does not exist,
-          # and the failure surfaces as "Datasource ... was not found" in a
-          # browser — which no Python test would otherwise catch.
-          used = {
-              p["datasource"]["uid"] for p in dash["panels"]
-              if isinstance(p.get("datasource"), dict) and "uid" in p["datasource"]
-          }
-          missing = used - uids
-          if missing:
-              sys.exit(f"dashboard references unknown datasource uids: {missing}")
-          if len(dash["panels"]) < 8:
-              sys.exit(f"dashboard lost panels: {len(dash['panels'])}")
-          if dash["uid"] != pathlib.Path(
-              "deploy/grafana/dashboards/toolmarket.json"
-          ).stem:
-              print("note: dashboard uid differs from filename")
-
-          # Every panel that has a target must have an expr, and every expr must
-          # name at least one toolmarket_* metric. This catches the copy-paste
-          # mistake that produces a panel which renders "No data" forever.
-          known = set()
-          for src in ("toolmarket/metrics.py", "toolmarket/api/main.py", "toolmarket/worker.py"):
-              text = pathlib.Path(src).read_text(encoding="utf-8")
-              for token in text.replace('"', " ").replace("'", " ").split():
-                  if token.startswith("toolmarket_"):
-                      known.add(token.strip("(),:{}"))
-          unknown = set()
-          for panel in dash["panels"]:
-              for target in panel.get("targets", []):
-                  expr = target.get("expr", "")
-                  names = {n for n in expr.replace("(", " ").replace(")", " ").split()
-                           if n.startswith("toolmarket_")}
-                  unknown |= {n for n in names if n not in known}
-          if unknown:
-              sys.exit(f"dashboard queries metrics no code emits: {sorted(unknown)}")
-
-          print(f"ok: {len(dash['panels'])} panels, datasources {sorted(uids)}")
-          PY
+          # The same script a developer runs locally, so the checks cannot drift
+          # between CI and the machine where the dashboard is edited. It validates
+          # datasource uids, every metric a panel queries, every metric an alert
+          # queries, and that every alert carries a severity (the routing label).
+          python tools/check_dashboards.py
 
   image:
     name: build + push image
