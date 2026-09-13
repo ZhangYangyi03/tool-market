@@ -172,7 +172,11 @@ jobs:
           # The async path must survive the bare-run defaults: an accepted task
           # whose id cannot be polled is the failure this asserts against, and it
           # is invisible to any test that only curls /health.
-          curl -fsS -X POST http://127.0.0.1:8123/resources/tool:missing/evolve/async \
+          # No `-f` here: `tool:missing` does not exist, so this call answers 404
+          # by design, and under `set -e` a failing curl would abort the step
+          # before the assertion below ever runs. This call only fires the
+          # request; the next one is the one that reads the status.
+          curl -sS -X POST http://127.0.0.1:8123/resources/tool:missing/evolve/async \
             -H 'content-type: application/json' -d '{"goal":"g"}' > /dev/null
           code=$(curl -s -o /dev/null -w '%{http_code}' \
             -X POST http://127.0.0.1:8123/resources/tool:missing/evolve/async \
