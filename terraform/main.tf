@@ -254,9 +254,19 @@ resource "docker_container" "worker" {
   # rather than merely alive: a worker whose broker connection has died still
   # has a running process, and a healthcheck that only proves liveness would
   # report that corpse as healthy.
+  #
+  # `$HOSTNAME` with ONE dollar, which is not a typo for the `$$HOSTNAME` in
+  # docker-compose.yml. Compose does its own `$VAR` interpolation and therefore
+  # needs `$$` to escape a literal dollar; Terraform does no such interpolation
+  # (only `${...}` is special to HCL) and passes `$$` through to the container
+  # verbatim. The container's `sh` then reads `$$` as its own PID, so `-d`
+  # addressed `celery@1234HOSTNAME`, a node that never exists — the probe failed
+  # forever with "No nodes replied within time constraint" while the worker was
+  # perfectly healthy. Porting a healthcheck between the two tools means
+  # re-checking every dollar sign, because the same text is not the same string.
   healthcheck {
     test = ["CMD-SHELL",
-      "celery -A toolmarket.worker:celery_app inspect ping -d celery@$$HOSTNAME --timeout 10",
+      "celery -A toolmarket.worker:celery_app inspect ping -d celery@$HOSTNAME --timeout 10",
     ]
     interval     = "30s"
     timeout      = "15s"
