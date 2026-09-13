@@ -9,7 +9,7 @@ API_PORT ?= 8000
 
 .PHONY: help install test lint check-config compose-up compose-obs compose-down \
         compose-logs smoke verify image psql redis-cli hf-deploy hf-deploy-docker \
-        render-init clean
+        render-init tf-init tf-plan tf-apply tf-ready tf-destroy clean
 
 help:  ## list targets
 	@grep -E '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sed 's/:.*## /  - /'
@@ -67,6 +67,21 @@ hf-deploy-docker:  ## publish the Dockerfile to a Space (needs a PRO account)
 render-init:  ## copy the Render blueprint to the repo root (Render reads it there)
 	cp deploy/render/render.yaml render.yaml
 	@echo "render.yaml copied; commit it and point a Blueprint at the repo"
+
+tf-init:  ## terraform: download the docker provider (~25 MB, once)
+	cd terraform && terraform init
+
+tf-plan:  ## terraform: show every change before any of it happens
+	cd terraform && terraform plan
+
+tf-apply:  ## terraform: bring up postgres + redis + api + worker as a graph
+	cd terraform && terraform apply
+
+tf-ready:  ## terraform: prove the stack found Postgres/Redis, not the fallbacks
+	@curl -s http://127.0.0.1:$(API_PORT)/ready
+
+tf-destroy:  ## terraform: tear the stack down (base images are kept)
+	cd terraform && terraform destroy
 
 clean:
 	rm -rf .pytest_cache **/__pycache__ *.egg-info build dist render.yaml
