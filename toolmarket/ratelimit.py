@@ -27,6 +27,7 @@ import time
 from typing import Any, Optional, Sequence
 
 from toolmarket import metrics as _metrics
+from toolmarket import tracing as _tracing
 from toolmarket.cache import get_cache
 
 DEFAULT_LIMIT = 120
@@ -95,6 +96,29 @@ def _route_label(scope: dict[str, Any]) -> str:
     return "<other>"
 
 
+def _headers(scope: dict[str, Any]) -> dict[str, str]:
+    """ASGI `scope["headers"]` -> a `str` dict.
+
+    ASGI carries headers as a list of raw `bytes` pairs in arrival order,
+    duplicated where a client or proxy sent a header twice — which is why the
+    result is a plain dict and a repeated name keeps its first value rather than
+    its last. For `traceparent` specifically that is the right choice: the
+    outermost sender's context is the one the trace should continue, and the
+    first header in the list is the outermost.
+    """
+    out: dict[str, str] = {}
+    for name, value in scope.get("headers") or ():
+        try:
+            key = name.decode("latin-1")
+            if key.lower() in out:
+                continue
+            out[key] = value.decode("latin-1")
+        except (AttributeError, UnicodeDecodeError):
+            # A malformed header must not fail the request. It is dropped.
+            continue
+    return out
+
+
 def _limit_key(scope: dict[str, Any]) -> str:
     """A bounded stand-in for the route template, available *before* routing.
 
@@ -153,6 +177,12 @@ class InstrumentedApp:
     should not appear in the latency histogram as a fast success), then the
     in-flight gauge, then the inner app, then the observations in a `finally` so
     a raising handler still records a status of 500 and a duration.
+
+    Metrics and tracing share this one wrapper rather than living in two
+    middlewares, because they need the same three facts (the scope, the status
+    the handler sent, and the elapsed time) and two wrappers would each compute
+    them — with the two answers eventually disagreeing about which requests
+    count. The class is named for instrumentation generally, not for the limiter.
     """
 
     def __init__(
@@ -223,19 +253,63 @@ class InstrumentedApp:
                 recorded["status"] = str(message.get("status", 0))
             await send(message)
 
-        try:
-            await self.app(scope, receive, send_wrapper)
-        finally:
-            elapsed = time.perf_counter() - started
-            route = _route_label(scope)
-            _metrics.HTTP_IN_FLIGHT.dec()
-            _metrics.HTTP_REQUESTS.inc(method=method, route=route,
-                                       status=recorded["status"])
-            # The body streaming has not finished when `app` returns for a
-            # streaming response, so this is time-to-headers for those routes.
-            # Noted rather than hidden: a route that streams for a minute would
-            # otherwise look like a 2 ms route.
-            _metrics.HTTP_LATENCY.observe(elapsed, method=method, route=route)
+        # The SERVER span opens here, after the limiter. Both halves of that
+        # order are deliberate: a refused request is not a server span (nothing
+        # was served, and a span per 429 turns a rate-limit incident into a trace
+        # flood), and this is the only place in the process holding an inbound
+        # `traceparent`. A trace may be *continued* anywhere, but it may only
+        # *begin* at an entry point — opening it deeper in the stack would make
+        # every handler the root of its own trace and lose the caller's.
+        #
+        # A `with` across the `await` rather than manual start/end: the scope
+        # restores the previous ambient span on the way out, so a failed request
+        # cannot leave a finished span installed for the next one on the same
+        # event loop to adopt as a parent.
+        with _tracing.span(
+            f"{method} {path}",
+            kind=_tracing.SPAN_SERVER,
+            parent=_tracing.extract(_headers(scope)),
+            attributes={
+                "http.method": method,
+                "url.path": path,
+                # No `http.route` here: at this point the router has not run, so
+                # `_route_label` can only return `<other>`. The `finally` sets the
+                # resolved template. Recording the placeholder would put a value
+                # that is known to be wrong on the span and, worse, would look
+                # like a resolved route to anything reading the attribute.
+            },
+        ) as span:
+            try:
+                await self.app(scope, receive, send_wrapper)
+            finally:
+                elapsed = time.perf_counter() - started
+                route = _route_label(scope)
+                _metrics.HTTP_IN_FLIGHT.dec()
+                _metrics.HTTP_REQUESTS.inc(method=method, route=route,
+                                           status=recorded["status"])
+                # The body streaming has not finished when `app` returns for a
+                # streaming response, so this is time-to-headers for those
+                # routes. Noted rather than hidden: a route that streams for a
+                # minute would otherwise look like a 2 ms route.
+                _metrics.HTTP_LATENCY.observe(elapsed, method=method, route=route)
+
+                # The route *template* is only known now that the router has run.
+                # Labelling the span with the raw path instead would make
+                # `/resources/tool:add` and `/resources/tool:mul` two unrelated
+                # operations in the backend — the same cardinality mistake the
+                # metrics route label exists to avoid.
+                status = int(recorded["status"])
+                span.set_attributes({
+                    "http.route": route,
+                    "http.status_code": status,
+                    "http.duration_ms": round(elapsed * 1000, 3),
+                })
+                # A 5xx is the server's failure, so the span is an error. A 4xx is
+                # not: the server did its job and the client asked for something
+                # it could not have, and marking those red makes every trace list
+                # look like an incident.
+                span.status = (_tracing.STATUS_ERROR if status >= 500
+                               else _tracing.STATUS_OK)
 
 
 def install(app: Any, **kwargs: Any) -> Any:

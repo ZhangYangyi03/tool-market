@@ -16,6 +16,17 @@ Configuration comes entirely from the environment:
     CELERY_RESULT_BACKEND default: the broker
     TASK_QUEUE            set to `celery` in the API so it enqueues instead of
                           running inline
+    OTEL_EXPORTER_OTLP_ENDPOINT
+                          unset -> no tracing. Set to a collector to get one
+                          trace spanning the API request and this worker's run.
+
+The trace is the interesting part of this module. The API puts a W3C
+`traceparent` in the *message headers* (`CeleryQueue.submit`), and this process —
+which shares no memory with the API — reads it back out and continues the same
+trace. That is the only thing that can survive the boundary: two hex strings in a
+header. Everything else about the API's context is gone by the time this code
+runs, which is precisely why the header exists and why the span below is created
+with an *explicit* parent rather than by inheriting an ambient one.
 """
 from __future__ import annotations
 
@@ -40,6 +51,86 @@ def _require() -> None:
             "the worker needs celery, which failed to import: "
             f"{_CELERY_ERR!r}. Install the extra: pip install 'tool-market[worker]'"
         )
+
+
+def _inbound_traceparent(task: Any) -> Optional[dict[str, str]]:
+    """The message headers of the delivery being handled, or None.
+
+    `self.request` is the bound-task context Celery populates per delivery, and
+    `headers` is what `send_task(headers=...)` put on the wire. Read
+    defensively: called outside a real delivery — a direct `.apply()` in a test, a
+    `celery call` from the shell — `request` may be absent or a stub, and a tracing
+    lookup must never be the thing that turns a working task into a failure.
+    """
+    request = getattr(task, "request", None)
+    headers = getattr(request, "headers", None)
+    if not isinstance(headers, dict):
+        return None
+    return headers
+
+
+def _run_evolution(task: Any, span: Any, store: Any, resource_id: str, goal: str,
+                   task_id: str, commit: bool, proposer: str) -> dict[str, Any]:
+    """The body of one evolution. Split out so the tracing wrapper is legible.
+
+    Takes `span` rather than opening one, so the progress callback can annotate
+    the same span the caller is timing — a second span here would report the
+    stage changes as a sibling of the run instead of as part of it.
+    """
+    from toolmarket import metrics as _metrics
+    from toolmarket.tasks import TaskRecord, TaskState, execute_evolution
+    import time as _time
+
+    def progress(stage: str, pct: float) -> None:
+        rec = store.get(task_id) or TaskRecord(task_id=task_id,
+                                               resource_id=resource_id)
+        rec.state = TaskState.RUNNING.value
+        rec.started_at = rec.started_at or _time.time()
+        rec.stage = stage
+        rec.progress = pct
+        rec.queue = "celery"
+        store.save(rec)
+        task.update_state(state="PROGRESS",
+                          meta={"stage": stage, "progress": pct})
+        span.set_attributes({"evolve.stage": stage, "evolve.progress": pct})
+
+    rec = store.get(task_id) or TaskRecord(task_id=task_id,
+                                          resource_id=resource_id,
+                                          queue="celery")
+    rec.state = TaskState.RUNNING.value
+    rec.started_at = _time.time()
+    rec.stage = "queued"
+    rec.queue = "celery"
+    # The worker learns the trace id from the message, not from the API, so this
+    # is where the pollable record gets it. Kept in step with the API's copy:
+    # both write the same value because both read the same traceparent.
+    rec.trace_id = span.trace_id if span is not None else rec.trace_id
+    store.save(rec)
+
+    try:
+        result = execute_evolution(
+            resource_id, goal, commit=commit, proposer=proposer,
+            task_id=task_id, registry=None, store=store, progress=progress,
+        )
+    except Exception as exc:  # noqa: BLE001
+        rec.state = TaskState.FAILURE.value
+        rec.error = f"{type(exc).__name__}: {exc}"
+        rec.finished_at = _time.time()
+        store.save(rec)
+        _metrics.EVOLUTIONS.inc(outcome="error")
+        # Re-raise so Celery records a FAILURE state too — the result backend
+        # is what a restarted API reads, and swallowing here would leave it
+        # reporting success for a run that never finished. The span is marked
+        # failed by the wrapper's context manager on the way out.
+        raise
+    rec.state = TaskState.SUCCESS.value
+    rec.result = result
+    rec.progress = 1.0
+    rec.finished_at = _time.time()
+    store.save(rec)
+    _metrics.EVOLUTIONS.inc(outcome="committed" if result.get("committed")
+                            else "rejected")
+    return result
 
 
 def build_celery(broker: Optional[str] = None,
@@ -77,60 +168,42 @@ def build_celery(broker: Optional[str] = None,
                commit: bool = True, proposer: str = "stub") -> dict[str, Any]:
         """Run one evolution in the worker process.
 
+        A thin wrapper whose only job is the trace, which is why the body lives in
+        `_run_evolution` instead: the boundary handling should be the first thing
+        visible in this function, not buried under progress bookkeeping.
+
         Progress is mirrored into the cache as each stage begins, because
         Celery's own states are coarse (`STARTED` / `SUCCESS`) and a client
         polling an evolution wants to know whether it is stuck in *assessing* —
         the stage that runs untrusted code — or waiting in the queue.
         """
-        from toolmarket import metrics as _metrics
-        from toolmarket.tasks import TaskRecord, TaskState, TaskStore, execute_evolution
+        from toolmarket.tasks import TaskStore
+        from toolmarket.tracing import SPAN_CONSUMER, extract, span as trace_span
 
         store = TaskStore()
 
-        def progress(stage: str, pct: float) -> None:
-            rec = store.get(task_id) or TaskRecord(task_id=task_id,
-                                                   resource_id=resource_id)
-            rec.state = TaskState.RUNNING.value
-            rec.started_at = rec.started_at or __import__("time").time()
-            rec.stage = stage
-            rec.progress = pct
-            rec.queue = "celery"
-            store.save(rec)
-            self.update_state(state="PROGRESS",
-                              meta={"stage": stage, "progress": pct})
+        # The parent is passed *explicitly* from the message header rather than
+        # left to the ambient span, and that is not a style choice: this process
+        # has no ambient span to inherit — the API's context died with the API's
+        # request — so an implicit parent would silently start a new trace here
+        # and the async half of every evolution would be a separate trace in the
+        # backend. `extract` returns None for an absent or malformed header, which
+        # correctly degrades to "start a fresh trace" for a task enqueued by hand.
+        inbound = extract(_inbound_traceparent(self))
 
-        rec = store.get(task_id) or TaskRecord(task_id=task_id,
-                                              resource_id=resource_id,
-                                              queue="celery")
-        rec.state = TaskState.RUNNING.value
-        rec.started_at = __import__("time").time()
-        rec.stage = "queued"
-        rec.queue = "celery"
-        store.save(rec)
-
-        try:
-            result = execute_evolution(
-                resource_id, goal, commit=commit, proposer=proposer,
-                task_id=task_id, registry=None, store=store, progress=progress,
-            )
-        except Exception as exc:  # noqa: BLE001
-            rec.state = TaskState.FAILURE.value
-            rec.error = f"{type(exc).__name__}: {exc}"
-            rec.finished_at = __import__("time").time()
-            store.save(rec)
-            _metrics.EVOLUTIONS.inc(outcome="error")
-            # Re-raise so Celery records a FAILURE state too — the result backend
-            # is what a restarted API reads, and swallowing here would leave it
-            # reporting success for a run that never finished.
-            raise
-        rec.state = TaskState.SUCCESS.value
-        rec.result = result
-        rec.progress = 1.0
-        rec.finished_at = __import__("time").time()
-        store.save(rec)
-        _metrics.EVOLUTIONS.inc(outcome="committed" if result.get("committed")
-                                else "rejected")
-        return result
+        with trace_span(
+            "toolmarket.evolve",
+            kind=SPAN_CONSUMER,
+            parent=inbound,
+            attributes={
+                "task.id": task_id,
+                "resource.id": resource_id,
+                "messaging.system": "celery",
+                "messaging.destination": "toolmarket.evolve",
+            },
+        ) as trace:
+            return _run_evolution(self, trace, store, resource_id, goal, task_id,
+                                  commit, proposer)
 
     return app
 

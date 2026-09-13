@@ -34,6 +34,7 @@ from enum import Enum
 from typing import Any, Callable, Optional
 
 from toolmarket import metrics as _metrics
+from toolmarket import tracing as _tracing
 
 TASK_PREFIX = "task"
 DEFAULT_TASK_TTL = 3600.0
@@ -62,6 +63,16 @@ class TaskRecord:
     result: Optional[dict[str, Any]] = None
     error: Optional[str] = None
     queue: str = "inline"
+    # The trace this run belongs to. Recorded on the task so the correlation is
+    # discoverable rather than inferred: an operator holding a task id can read
+    # the trace id off `/tasks/{id}` and open the waterfall directly, instead of
+    # searching a trace backend by timestamp and hoping. Empty when tracing is
+    # off, which is also how a caller can tell that it is off.
+    #
+    # A new field on a cached record is safe because `from_dict` drops unknown
+    # keys and defaults missing ones — a task written before this field existed
+    # still loads, with `trace_id` empty.
+    trace_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -246,16 +257,34 @@ class InlineQueue:
                proposer: str = "stub") -> TaskRecord:
         task_id = uuid.uuid4().hex
         rec = TaskRecord(task_id=task_id, resource_id=resource_id, goal=goal,
-                         state=TaskState.PENDING.value, queue=self.backend)
+                         state=TaskState.PENDING.value, queue=self.backend,
+                         # Captured before the thread starts, because the thread
+                         # gets a *copy* of this context: reading it inside would
+                         # work for the inline queue and silently record "" for
+                         # Celery, where the consumer's context is a different one.
+                         trace_id=_tracing.current_context().trace_id)
         # No index bookkeeping here: `TaskStore.save` owns it, so an inline task
         # and a Celery task are counted by the same code path.
         self.store.save(rec)
 
-        def run() -> None:
-            self._run(task_id, resource_id, goal, commit, proposer)
+        # A PRODUCER span around the handoff, closed before the work runs, and
+        # `in_thread` — not a bare `Thread` — so the worker thread starts inside a
+        # copy of this context. A plain `Thread` would get an empty context, the
+        # ambient request span would be invisible in it, and the evolution would
+        # open its own trace: one operation, two traces, and the API's looking
+        # like it finished when the enqueue returned. Nothing raises when this is
+        # wrong; that is why it is called out here and asserted in
+        # `tests/test_tracing.py`.
+        with _tracing.span(
+            "evolve.enqueue",
+            kind=_tracing.SPAN_PRODUCER,
+            attributes={"task.id": task_id, "resource.id": resource_id,
+                        "queue": self.backend, "messaging.system": "thread"},
+        ):
+            def run() -> None:
+                self._run(task_id, resource_id, goal, commit, proposer)
 
-        thread = threading.Thread(target=run, name=f"evolve-{task_id[:8]}",
-                                  daemon=True)
+            thread = _tracing.in_thread(run, name=f"evolve-{task_id[:8]}")
         with self._lock:
             self._threads[task_id] = thread
         thread.start()
@@ -263,6 +292,21 @@ class InlineQueue:
 
     def _run(self, task_id: str, resource_id: str, goal: str, commit: bool,
              proposer: str) -> None:
+        # A CONSUMER span, not a root: `in_thread` put the producer's span in this
+        # thread's context, so this is `start_span` with no explicit parent and it
+        # still attaches to the request's trace. Passing the parent explicitly
+        # would also work and would hide a broken `in_thread` — which is exactly
+        # the bug worth not hiding.
+        with _tracing.span(
+            "evolve.run",
+            kind=_tracing.SPAN_CONSUMER,
+            attributes={"task.id": task_id, "resource.id": resource_id,
+                        "queue": self.backend},
+        ) as span:
+            self._run_inner(span, task_id, resource_id, goal, commit, proposer)
+
+    def _run_inner(self, span: Any, task_id: str, resource_id: str, goal: str,
+                   commit: bool, proposer: str) -> None:
         rec = self.store.get(task_id) or TaskRecord(task_id=task_id,
                                                     resource_id=resource_id)
         rec.state = TaskState.RUNNING.value
@@ -275,6 +319,11 @@ class InlineQueue:
             current.stage = stage
             current.progress = pct
             self.store.save(current)
+            # Mirrored onto the span so a trace shows *where* a slow evolution
+            # spent its time without a second lookup: the stage names are the same
+            # strings the task record carries, so a trace and a `/tasks/{id}` poll
+            # cannot disagree about what was happening.
+            span.set_attributes({"evolve.stage": stage, "evolve.progress": pct})
 
         try:
             result = execute_evolution(
@@ -345,15 +394,38 @@ class CeleryQueue:
                proposer: str = "stub") -> TaskRecord:
         task_id = uuid.uuid4().hex
         rec = TaskRecord(task_id=task_id, resource_id=resource_id, goal=goal,
-                         state=TaskState.PENDING.value, queue=self.backend)
+                         state=TaskState.PENDING.value, queue=self.backend,
+                         # Captured before the thread starts, because the thread
+                         # gets a *copy* of this context: reading it inside would
+                         # work for the inline queue and silently record "" for
+                         # Celery, where the consumer's context is a different one.
+                         trace_id=_tracing.current_context().trace_id)
         self.store.save(rec)
         try:
-            self.app.send_task(
-                "toolmarket.evolve",
-                args=[resource_id, goal, task_id],
-                kwargs={"commit": commit, "proposer": proposer},
-                task_id=task_id,
-            )
+            # The PRODUCER span covers the handoff only; the consumer's span is
+            # created in the worker process and attaches to this same trace. Note
+            # that `inject` is called *inside* the span's scope, so what it writes
+            # is this span's context — inject outside and a downstream service gets
+            # the caller's parent instead of the enqueue operation, which makes the
+            # broker hop invisible in the waterfall.
+            with _tracing.span(
+                "evolve.send",
+                kind=_tracing.SPAN_PRODUCER,
+                attributes={"task.id": task_id, "resource.id": resource_id,
+                            "messaging.system": "celery",
+                            "messaging.destination": "toolmarket.evolve"},
+            ):
+                self.app.send_task(
+                    "toolmarket.evolve",
+                    args=[resource_id, goal, task_id],
+                    kwargs={"commit": commit, "proposer": proposer},
+                    task_id=task_id,
+                    # Headers, not `kwargs`: the task's own signature stays free of
+                    # tracing, so a caller invoking `toolmarket.evolve` by hand — or
+                    # a future non-Python producer — is not required to know that
+                    # the substrate propagates context at all.
+                    headers=_tracing.inject({}),
+                )
         except Exception as exc:  # noqa: BLE001
             rec.state = TaskState.FAILURE.value
             rec.error = f"could not enqueue: {type(exc).__name__}: {exc}"
