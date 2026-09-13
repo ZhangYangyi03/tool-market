@@ -250,10 +250,21 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
             cache_ok = False
         payload = {
             "ready": store_ok and cache_ok,
+            # `"unknown"`, never a specific backend, for a component that has not
+            # declared one. The previous defaults were `"sqlite"` and `"none"` —
+            # real backend names, and wrong ones whenever the object in hand did
+            # not declare an attribute of its own. A Postgres stack reported
+            # `sqlite`, and the single call whose whole job is to say which store
+            # you actually connected to was the call that could not.
+            #
+            # Both stores now declare `backend`, so this branch is a guard rather
+            # than a routine path. It stays a guard that cannot lie: naming a
+            # backend the code did not confirm is worse than admitting ignorance,
+            # because it is indistinguishable from a correct answer.
             "store": {"ok": store_ok,
-                      "backend": getattr(reg.store, "backend", "sqlite")},
+                      "backend": getattr(reg.store, "backend", "unknown")},
             "cache": {"ok": cache_ok,
-                      "backend": getattr(get_cache(), "backend", "none")},
+                      "backend": getattr(get_cache(), "backend", "unknown")},
             "queue": {"backend": getattr(app.state.queue, "backend", "inline")},
         }
         status = 200 if payload["ready"] else 503

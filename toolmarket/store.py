@@ -70,6 +70,14 @@ class ResourceStore:
     another (`wait_ready` -> `ping`) without deadlocking against itself.
     """
 
+    # Declared, not inferred. `/ready` reports the backend by reading this
+    # attribute, and the three cache classes have always declared theirs — the
+    # stores never did, so the endpoint fell back to a hard-coded "sqlite" and
+    # reported that for *every* backend. A Postgres deployment therefore read as
+    # SQLite, and the one call whose entire job is to tell you which store you
+    # actually connected to was the call that could not.
+    backend = "sqlite"
+
     def __init__(self, path: str | Path = ":memory:") -> None:
         self.path = str(path)
         self._lock = threading.RLock()

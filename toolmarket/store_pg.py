@@ -110,6 +110,11 @@ class PostgresStore:
     """The SQLite store's surface, on PostgreSQL. `dsn` like
     `postgresql://user:pw@host:5432/db`."""
 
+    # Read by `/ready` to name the connected backend. See the note on
+    # `ResourceStore.backend`: without this the endpoint's default reported
+    # "sqlite" for a stack that was in fact on Postgres.
+    backend = "postgres"
+
     def __init__(
         self,
         dsn: str,

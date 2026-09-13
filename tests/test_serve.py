@@ -123,6 +123,50 @@ def test_ready_is_503_when_the_store_is_unreachable(monkeypatch):
     assert c.get("/health").status_code == 200
 
 
+def test_ready_never_names_a_backend_the_store_did_not_declare(monkeypatch):
+    """A store with no `backend` must read as `unknown`, not as some real one.
+
+    This is the regression for a reporting bug that no amount of green tests
+    could catch: `/ready` read the backend with `getattr(store, "backend",
+    "sqlite")`, and `PostgresStore` — alone among the backends, since the three
+    cache classes all declared theirs — never had the attribute. So a stack
+    running on Postgres reported `sqlite`, and the one call whose entire job is
+    to tell you which store you connected to was the one that could not.
+
+    `test_ready_reports_each_dependency_separately` asserted `== "sqlite"` and
+    passed the whole time, because an in-memory store returning `"sqlite"` is
+    correct *and* is what the fallback returned. A test cannot catch a default
+    by asserting the value the default produces; it has to take the attribute
+    away and check what the endpoint says then.
+    """
+    c, reg, _ = _client()
+
+    class Nameless:
+        """A store that answers `ping` and declares nothing about itself."""
+
+        def ping(self) -> bool:
+            return True
+
+    monkeypatch.setattr(reg, "store", Nameless())
+    body = c.get("/ready").json()
+    assert body["store"]["backend"] == "unknown"
+    assert body["store"]["backend"] != "sqlite"
+
+
+def test_every_shipped_store_declares_its_backend():
+    """The attribute is part of the store interface, so assert it on the classes.
+
+    Checked at the class rather than through `/ready` because the bug was a
+    *missing declaration*, and the endpoint now has an `"unknown"` fallback that
+    would hide the next one just as `"sqlite"` hid this one.
+    """
+    from toolmarket.store import ResourceStore
+    from toolmarket.store_pg import PostgresStore
+
+    assert ResourceStore.backend == "sqlite"
+    assert PostgresStore.backend == "postgres"
+
+
 def test_stats_reports_the_backend_and_path():
     c, _reg, _ = _client()
     body = c.get("/stats").json()
