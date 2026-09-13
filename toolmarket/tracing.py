@@ -345,6 +345,10 @@ def _resolve_parent(parent: Optional[Any]) -> tuple[str, str, bool]:
 # backpressure to the request path turns a slow collector into a slow API, and
 # the trace data it is protecting is diagnostic — worth less than the request.
 _MAX_QUEUE = 2048
+# One POST per span would be chatty; one POST per hour would be useless. Also
+# the reason batching is not a contract: two spans emitted microseconds apart
+# land in the same batch or in two depending on when the drain thread wakes.
+_MAX_BATCH = 256
 
 
 class OtlpHttpExporter:
@@ -406,20 +410,29 @@ class OtlpHttpExporter:
             }],
         }
 
+    def _collect_batch(self, first: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """`first` plus whatever else is already waiting, up to the ceiling.
+
+        Split out from the loop so it can be driven without a live thread.
+        Coalescing is an efficiency, not a promise: whether two spans emitted
+        back to back share a POST depends on thread scheduling, so nothing may
+        assert on it.
+        """
+        batch = list(first)
+        while len(batch) < _MAX_BATCH:
+            try:
+                batch.extend(self._queue.get_nowait())
+            except queue.Empty:
+                break
+        return batch
+
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
                 batch = self._queue.get(timeout=0.5)
             except queue.Empty:
                 continue
-            # Drain whatever else is waiting, up to a batch ceiling: one POST per
-            # span would be chatty, and one POST per hour would be useless.
-            while len(batch) < 256:
-                try:
-                    batch.extend(self._queue.get_nowait())
-                except queue.Empty:
-                    break
-            self._post(batch)
+            self._post(self._collect_batch(batch))
 
     def _post(self, spans: Sequence[dict[str, Any]]) -> None:
         body = json.dumps(self._payload(spans)).encode("utf-8")

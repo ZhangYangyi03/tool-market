@@ -354,8 +354,16 @@ def test_an_unparented_span_omits_parent_span_id():
     assert "parentSpanId" not in span.to_otlp()
 
 
-def test_exporter_posts_a_batch_and_builds_the_signal_url():
-    """One POST per batch, to `<endpoint>/v1/traces`."""
+def test_exporter_posts_to_the_signal_url():
+    """Every span reaches `<endpoint>/v1/traces`.
+
+    Deliberately silent on *how many* POSTs. Coalescing depends on when the
+    drain thread wakes relative to the next `emit`, so a version of this that
+    asserted one batch would pass or fail on scheduler luck — it did, on
+    py3.11 only, which is what a race looks like when it is mistaken for a
+    platform difference. The batch is a transport detail; delivery is the
+    contract. Coalescing is pinned below, deterministically.
+    """
     posted: list[tuple[str, dict]] = []
 
     exporter = OtlpHttpExporter("http://collector:4318", "svc")
@@ -366,12 +374,40 @@ def test_exporter_posts_a_batch_and_builds_the_signal_url():
         pass
     with t.span("b"):
         pass
-    exporter.flush(timeout=3)
+
+    # Wait for delivery rather than for the queue to look empty: a batch is
+    # taken off the queue before it is posted, so "empty" can be observed
+    # mid-flight.
+    delivered: list[str] = []
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        delivered = [s["name"] for _, batch in posted for s in batch]
+        if sorted(delivered) == ["a", "b"]:
+            break
+        time.sleep(0.02)
 
     assert exporter.url == "http://collector:4318/v1/traces"
     assert posted, "exporter never posted"
-    assert len(posted[0][1]) >= 2, "spans were not batched"
+    assert sorted(delivered) == ["a", "b"], f"lost spans: {delivered}"
     exporter.shutdown()
+
+
+def test_exporter_coalesces_what_is_already_queued():
+    """The drain step takes everything waiting, so N queued spans cost one POST.
+
+    Driven directly with the thread already stopped, because that is the only
+    way to ask "given three spans waiting, how many POSTs?" without racing the
+    thread that would answer it.
+    """
+    exporter = OtlpHttpExporter("http://collector:4318", "svc")
+    exporter.shutdown()  # stop the drain thread; the test drives the batch
+
+    for name in ("a", "b", "c"):
+        exporter._queue.put_nowait([{"name": name}])
+
+    batch = exporter._collect_batch(exporter._queue.get_nowait())
+    assert [s["name"] for s in batch] == ["a", "b", "c"]
+    assert exporter._queue.empty()
 
 
 def test_exporter_does_not_double_append_the_signal_path():
