@@ -36,7 +36,7 @@ resource "docker_volume" "pgdata" {
 # -- images -----------------------------------------------------------------
 
 resource "docker_image" "postgres" {
-  name         = "postgres:16-alpine"
+  name = "postgres:16-alpine"
   # Kept after `destroy`: re-pulling 80 MB to prove a teardown worked is a tax
   # on the next `apply`, and the image is not what this config owns.
   keep_locally = true
@@ -58,15 +58,32 @@ resource "docker_image" "app" {
     target = "runtime"
   }
 
-  # Rebuild when the inputs to the image change. `Dockerfile` covers the stages;
-  # `pyproject.toml` covers the dependency pins — including the autoforge commit,
-  # which is the one pin that changes the enforcement engine's behaviour without
-  # changing a line of this repo. Without this trigger Terraform would see an
-  # unchanged `name` and keep a stale image, and the symptom would be a fix that
-  # passed locally and was ignored in the container.
+  # Rebuild when the inputs to the image change — and there are three of them,
+  # not the two that are easy to remember.
+  #
+  #   * `Dockerfile` — the stages themselves.
+  #   * `pyproject.toml` — the dependency pins, including the autoforge commit.
+  #     That pin is the one input that changes the enforcement engine's behaviour
+  #     without changing a line of this repository.
+  #   * the package source. `COPY toolmarket/ ./toolmarket/` puts every module in
+  #     the image, so a one-line fix to a Python file is an input to the build
+  #     exactly as much as the Dockerfile is. Omitting this is the trap: Terraform
+  #     sees an unchanged image `name`, keeps the stale image, and the symptom is
+  #     a fix that passes every local test and is silently absent from the
+  #     container — which is the worst possible shape for this bug, because the
+  #     evidence points at the code rather than at the image.
+  #
+  # `fileset` + `filesha256` rather than the `archive_file` data source: this
+  # needs the built-in provider only, so `terraform init` stays a one-provider
+  # download, and hashing a sorted file list is deterministic without writing an
+  # intermediate archive anywhere.
   triggers = {
     dockerfile = filesha256("${path.module}/../Dockerfile")
     pyproject  = filesha256("${path.module}/../pyproject.toml")
+    source = sha256(join("", [
+      for f in sort(fileset("${path.module}/../toolmarket", "**/*.py")) :
+      filesha256("${path.module}/../toolmarket/${f}")
+    ]))
   }
 }
 
@@ -102,7 +119,7 @@ resource "docker_container" "postgres" {
   }
 
   networks_advanced {
-    name    = docker_network.substrate.name
+    name = docker_network.substrate.name
     # The alias, not the container name: the DSNs say `postgres`, and binding
     # that here means `stack_name` can change without touching a connection
     # string. The container name carries the prefix for a human reading
@@ -117,12 +134,20 @@ resource "docker_container" "redis" {
   restart  = "unless-stopped"
   must_run = true
 
-  # `--save ""` because nothing here treats Redis as durable: the cache is a
-  # cache, task records are operational, and a broker's queue is
-  # re-submittable. Persisting it would buy an fsync per evolution for the
-  # privilege of restoring a stale cache across restarts.
+  # Persistence off, because nothing here treats Redis as durable: the cache is a
+  # cache, task records are operational, and a broker's queue is re-submittable.
+  # Persisting it would buy an fsync per evolution for the privilege of restoring
+  # a stale cache across restarts.
+  #
+  # `--save` with **no argument**, not `--save ""`. They are the same directive
+  # to Redis — a `save` line with no arguments clears the save points — but the
+  # provider rejects an empty string in `command` outright ("values for command
+  # may not be empty"), and it is right to: `command` becomes argv directly, with
+  # no shell to collapse a quoted empty string, so `""` is not a value Redis
+  # could distinguish from a bug. Verified against redis:7-alpine that the
+  # no-argument form leaves `CONFIG GET save` empty and the server alive.
   command = [
-    "redis-server", "--save", "", "--appendonly", "no",
+    "redis-server", "--save", "--appendonly", "no",
     "--maxmemory", var.redis_maxmemory, "--maxmemory-policy", "allkeys-lru",
   ]
 

@@ -40,5 +40,21 @@ experiments/results/_replay*
 
 # Deployment descriptors are read by the deploy tooling, not by the image
 docker-compose.yml
+render.yaml
 deploy/
 docs/
+
+# Terraform's working directory, and this one is not hygiene — it is a build that
+# cannot succeed without it. `.terraform/` holds the provider binary Terraform is
+# *executing at the moment it streams this context to the daemon*; that binary is
+# ~66 MB of the repo's ~70 MB working tree. The provider uses the legacy build
+# API, which sends the context as one tar stream, and the daemon closes the
+# connection partway through reading it — surfacing as `failed to read
+# dockerfile: unexpected EOF`, an error that names the Dockerfile and is actually
+# about the provider's own executable being read while it runs.
+#
+# `terraform/` wholesale rather than just `.terraform/`: the .tf files describe a
+# stack and are not inputs to the image, so there is no version of this where the
+# image should see them. State files would additionally be a credential leak —
+# `terraform.tfstate` holds the Postgres password in cleartext.
+terraform/
