@@ -38,6 +38,12 @@ K8S_CONTEXT ?= kind-$(K8S_CLUSTER)
 # it was not asked to test. A separate port lets both run at once, which is also
 # how you compare them.
 K8S_PORT ?= 18000
+# Same reasoning one line up, and for the same failure: `tf-ready` used to curl
+# `$(API_PORT)`, which is the *compose* stack's port. With compose up, `make
+# tf-ready` answered 200 from a container Terraform never created, so the target
+# whose entire job is "prove this stack found Postgres and Redis" reported on a
+# different stack. Its own port, so the two can run side by side.
+TF_API_PORT ?= 18001
 
 .PHONY: help install test lint check-config grpc-gen compose-up compose-obs compose-down \
         compose-logs smoke verify image psql redis-cli hf-deploy hf-deploy-docker \
@@ -111,13 +117,13 @@ tf-init:  ## terraform: download the docker provider (~25 MB, once)
 	cd terraform && terraform init
 
 tf-plan:  ## terraform: show every change before any of it happens
-	cd terraform && terraform plan
+	cd terraform && terraform plan -var api_port=$(TF_API_PORT)
 
 tf-apply:  ## terraform: bring up postgres + redis + api + worker as a graph
-	cd terraform && terraform apply
+	cd terraform && terraform apply -var api_port=$(TF_API_PORT)
 
 tf-ready:  ## terraform: prove the stack found Postgres/Redis, not the fallbacks
-	@curl -s http://127.0.0.1:$(API_PORT)/ready
+	@curl -s "$$(cd terraform && terraform output -raw ready_url)"
 
 tf-destroy:  ## terraform: tear the stack down (base images are kept)
 	cd terraform && terraform destroy

@@ -24,6 +24,15 @@ terraform plan          # read this
 terraform apply         # builds the image, starts five containers
 ```
 
+The same three steps are wrapped as `make tf-init`, `make tf-plan` and
+`make tf-apply`, which pass `api_port=$(TF_API_PORT)` — see the port note below.
+`make tf-ready` is the verification step, and it takes its URL from the state
+rather than from a constant:
+
+```sh
+make tf-ready           # curl the ready_url this stack actually published
+```
+
 Then verify it actually found the backends rather than falling back:
 
 ```sh
@@ -71,6 +80,15 @@ pin that moves changes the enforcement engine's behaviour without changing a lin
 of this repository. Without the trigger, Terraform would see an unchanged image
 name, keep the stale one, and the symptom would be a fix that passes locally and
 is silently ignored in the container.
+
+**The API is published on 18001 here, not 8000, and that is the same rule the
+Kubernetes path follows.** `docker compose up` owns 8000. A Terraform stack that
+also claimed it would fail to bind — or worse, `make tf-ready` would curl
+`127.0.0.1:8000`, get a 200 from the *compose* container, and report a stack it
+never created as healthy. The target's whole job is to say which backends the
+API actually found, so answering from the wrong API is the one failure it cannot
+afford. Hence a port of its own (`TF_API_PORT`, overridable) and a URL read out
+of the state instead of typed twice.
 
 **State is gitignored and must stay that way.** `terraform.tfstate` holds the
 Postgres password in cleartext, because that is what the resource declares. It is
