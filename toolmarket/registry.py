@@ -67,7 +67,18 @@ class ResourceRegistry:
         self.log: EventLog = log or self.store.load_events()
         # Every append becomes durable at the sink, so the operator's evolution
         # events are persisted exactly like the registry's own.
-        self.log.on_append = self.store.append_event
+        #
+        # *Which* sink is the concurrency contract, and getting it wrong is a 500
+        # rather than a slow path. The API and the Celery worker each build their
+        # own registry over one shared store, so both hold a `_events` mirror that
+        # knows only what that process has seen. Let either of them take `seq` from
+        # that mirror and both eventually write event N — the first after the
+        # worker's evolution appended anything at all. So a store that can allocate
+        # does (`reserve_event`), and only a store that cannot falls back to
+        # sealing in the log and handing the finished event over.
+        reserve = getattr(self.store, "reserve_event", None)
+        self.log.on_reserve = reserve
+        self.log.on_append = None if reserve else self.store.append_event
         self.lineage: LineageGraph = lineage or self.store.load_lineage()
         self._records: dict[str, ResourceRecord] = {
             r.id: r for r in self.store.load_resources()

@@ -19,7 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from typing import Any, Callable, Iterator, Optional
 
@@ -78,14 +78,49 @@ class Event:
         return cls(**d)
 
 
+def seal(
+    kind: EventKind,
+    resource_id: str,
+    *,
+    seq: int,
+    prev: Optional[str],
+    data: Optional[dict[str, Any]] = None,
+    actor: str = "system",
+    at: Optional[float] = None,
+) -> Event:
+    """Build and hash one event from an already-decided `(seq, prev)` pair.
+
+    Split out of `append` because a store that allocates those two values
+    *itself* — from the database, under a lock — still has to seal what it
+    allocated, and sealing in two places is how one chain acquires two dialects.
+    There is exactly one definition of what an event's hash covers.
+    """
+    draft = Event(
+        seq=seq,
+        kind=EventKind(kind),
+        resource_id=resource_id,
+        at=time.time() if at is None else at,
+        data=data or {},
+        actor=actor,
+        prev=prev,
+    )
+    return replace(draft, hash=draft._digest())
+
+
 class EventLog:
-    """An append-only log. Persist it by wiring an `on_append` sink.
+    """An append-only log. Persist it by wiring an `on_append` sink — or, when
+    more than one process appends to it, an `on_reserve` sink.
 
     The sink is the single point at which an event becomes durable, so *every*
     append — from the registry, from the evolution operator, from a future
     module — is persisted without each caller remembering to. A log that only
     persisted when you called the right helper would silently lose the events
     that matter most (the ones an evolution produced).
+
+    What the sink does *not* get to do is choose `seq`. This object's `_events`
+    is a mirror of what this process has seen, and in a multi-process deployment
+    it is a partly stale one; a `seq` derived from its length is a claim about a
+    database that this object cannot see. See `append`.
     """
 
     def __init__(
@@ -93,9 +128,13 @@ class EventLog:
         events: Optional[list[Event]] = None,
         *,
         on_append: Optional[Callable[["Event"], None]] = None,
+        on_reserve: Optional[Callable[[Callable[[int, Optional[str]], "Event"]], "Event"]] = None,
     ) -> None:
         self._events: list[Event] = list(events or [])
         self.on_append: Optional[Callable[["Event"], None]] = on_append
+        self.on_reserve: Optional[
+            Callable[[Callable[[int, Optional[str]], "Event"]], "Event"]
+        ] = on_reserve
 
     def __len__(self) -> int:
         return len(self._events)
@@ -115,28 +154,43 @@ class EventLog:
         data: Optional[dict[str, Any]] = None,
         actor: str = "system",
     ) -> Event:
-        """Append one event. The log assigns `seq` and seals the hash chain."""
-        draft = Event(
-            seq=len(self._events),
-            kind=EventKind(kind),
-            resource_id=resource_id,
-            data=data or {},
-            actor=actor,
-            prev=self.head,
-        )
-        sealed = Event(
-            seq=draft.seq,
-            kind=draft.kind,
-            resource_id=draft.resource_id,
-            at=draft.at,
-            data=draft.data,
-            actor=draft.actor,
-            prev=draft.prev,
-            hash=draft._digest(),
-        )
+        """Append one event, sealed — durable first, mirrored second.
+
+        Who decides `seq` and `prev` is the whole question, and there are exactly
+        two answers:
+
+          * `on_reserve` — the *store* decides, inside its own write
+            transaction, and calls the builder it is handed with the `(seq, prev)`
+            it allocated. This is the only arrangement that is correct when more
+            than one process appends: two processes each taking `seq` from their
+            own mirror both call themselves event 29, and the second INSERT dies
+            on the primary key. With the store allocating, this object's memory
+            is a cache of the tail rather than the source of the counter.
+          * otherwise the log decides — `seq` is its length, `prev` its head —
+            and `on_append` persists the result. Correct for a bare log and for a
+            store only one process ever writes, and it costs no round trip.
+
+        The mirror is updated *after* the sink returns, so an append that the
+        store refused does not linger in memory pretending to have happened.
+        """
+        if self.on_reserve is not None:
+            sealed = self.on_reserve(
+                lambda seq, prev: seal(
+                    kind, resource_id, seq=seq, prev=prev, data=data, actor=actor
+                )
+            )
+        else:
+            sealed = seal(
+                kind,
+                resource_id,
+                seq=len(self._events),
+                prev=self.head,
+                data=data,
+                actor=actor,
+            )
+            if self.on_append is not None:
+                self.on_append(sealed)
         self._events.append(sealed)
-        if self.on_append is not None:
-            self.on_append(sealed)
         return sealed
 
     def for_resource(self, resource_id: str) -> list[Event]:

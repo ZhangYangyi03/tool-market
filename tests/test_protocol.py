@@ -376,3 +376,35 @@ def test_evolution_events_and_lineage_survive_persistence(tmp_path):
     kinds = [n.mutation for n in reg2.lineage.of_resource("tool:slugify")]
     assert "rollback" in kinds
     store2.close()
+
+
+def test_two_writers_over_one_log_do_not_fork_the_chain(tmp_path):
+    """The API and the Celery worker are two processes over one store.
+
+    Both come up, both load the log, and only *then* do they write. With `seq`
+    as `len(self._events)` — the length of a mirror that knows only this
+    process's events — each writer independently concludes it is writing event
+    N, and the second INSERT dies on the primary key. In the deployed stack that
+    is a 500 on `POST /resources` the first time the worker's evolution appends
+    anything: the first smoke run passes because the log is empty, and every run
+    after it fails. `seq` has to be a fact about the database, not about one
+    process's memory of it.
+
+    Both writers are stood up *before* either writes, because that is the order
+    that collides — two mirrors stale at boot, not a live race.
+    """
+    db = str(tmp_path / "shared.db")
+    a = ResourceRegistry(ResourceStore(db))
+    b = ResourceRegistry(ResourceStore(db))
+
+    for i in range(5):
+        a.log.append(EventKind.REGISTER, "tool:a", data={"i": i})
+        b.log.append(EventKind.REGISTER, "tool:b", data={"i": i})
+
+    reloaded = ResourceStore(db).load_events()
+    assert [e.seq for e in reloaded] == list(range(10)), "seq must stay contiguous"
+    # One chain, not two: every `prev` is the previous event's hash, no matter
+    # which writer produced it.
+    assert reloaded.verify_chain()
+    assert len(reloaded.for_resource("tool:a")) == 5
+    assert len(reloaded.for_resource("tool:b")) == 5

@@ -7,7 +7,7 @@ implements the *same duck-typed surface* as `ResourceStore` and nothing above
 the store changes. `ResourceRegistry` cannot tell the two apart, which is why
 there is no interface to extract — the interface was always the method names.
 
-Three differences from the SQLite store are deliberate:
+Four differences from the SQLite store are deliberate:
 
   * `json` columns are **JSONB**, not TEXT. The substrate's records are queried,
     not just fetched (which resources are ACTIVE, which events belong to a
@@ -24,6 +24,13 @@ Three differences from the SQLite store are deliberate:
     path because a file path cannot hold a password. A DSN can, and this dict is
     reachable from `GET /stats` — so the password is stripped here rather than
     left to every caller to remember.
+  * The next `seq` and the chain head live in a one-row `event_head` table, which
+    an append locks with `SELECT ... FOR UPDATE`. SQLite gets the same guarantee
+    from `BEGIN IMMEDIATE`, which locks the whole database; Postgres has no
+    coarse switch like that, so the lock has to be named. Without a lock the
+    allocation is a read of a value another writer is about to move, and the
+    `events` primary key catches the collision only after the client has been
+    told its registration failed.
 
 Connections come from a `ThreadedConnectionPool`: the API serves requests on a
 threadpool and the Celery worker runs in another process entirely, so a single
@@ -34,7 +41,7 @@ from __future__ import annotations
 import json
 import time
 from contextlib import contextmanager
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 from toolmarket.protocol.events import Event, EventLog
@@ -74,6 +81,23 @@ CREATE TABLE IF NOT EXISTS lineage (
     json         JSONB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_lineage_resource ON lineage(resource_id);
+-- The log's head, in a single row, so an append can lock the thing it is about
+-- to move. `seq` is *allocated here*, not derived from a process's memory of the
+-- log: with two writers — the API and the Celery worker — a length-derived `seq`
+-- is a claim about a database that neither process can see, and the primary key
+-- on `events` then turns the collision into a 500 rather than into a fact.
+-- The seed backfills from the events already present, so deploying this onto a
+-- database that has a log continues that chain instead of restarting it.
+CREATE TABLE IF NOT EXISTS event_head (
+    only_one   BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (only_one),
+    next_seq   INTEGER NOT NULL,
+    head_hash  TEXT
+);
+INSERT INTO event_head(only_one, next_seq, head_hash)
+SELECT TRUE,
+       COALESCE((SELECT MAX(seq) + 1 FROM events), 0),
+       (SELECT json->>'hash' FROM events ORDER BY seq DESC LIMIT 1)
+ON CONFLICT (only_one) DO NOTHING;
 """
 
 
@@ -218,6 +242,10 @@ class PostgresStore:
 
     # -- events -----------------------------------------------------------
     def append_event(self, event: Event) -> None:
+        # Deliberately dumb: the caller already sealed this event, so all that is
+        # left is to store it or refuse. Allocation lives in `reserve_event`,
+        # which is what the log is wired to; this is the primitive it and the
+        # tests use directly.
         with self._cursor(commit=True) as cur:
             cur.execute(
                 "INSERT INTO events(seq, resource_id, kind, json, at) "
@@ -225,6 +253,39 @@ class PostgresStore:
                 (event.seq, event.resource_id, event.kind.value,
                  json.dumps(event.to_dict(), default=str), event.at),
             )
+
+    def reserve_event(
+        self, build: Callable[[int, Optional[str]], Event]
+    ) -> Event:
+        """The `on_reserve` contract: the *database* decides `seq` and `prev`.
+
+        It hands the builder the `(next_seq, head_hash)` it read, seals and
+        inserts whatever comes back, and advances the head — all inside one
+        transaction, with the head row locked for the duration. Two processes
+        therefore serialize on that row instead of on their own guess at the
+        tail, and `seq` stays contiguous because a rollback rolls the head back
+        with it rather than burning a number.
+
+        The client only ever sees this through `EventLog.append`, which is the
+        point: nothing above the store had to learn that there is a second writer.
+        """
+        with self._cursor(commit=True) as cur:
+            cur.execute(
+                "SELECT next_seq, head_hash FROM event_head WHERE only_one FOR UPDATE"
+            )
+            seq, prev = cur.fetchone()
+            event = build(seq, prev)
+            cur.execute(
+                "INSERT INTO events(seq, resource_id, kind, json, at) "
+                "VALUES(%s, %s, %s, %s::jsonb, %s)",
+                (event.seq, event.resource_id, event.kind.value,
+                 json.dumps(event.to_dict(), default=str), event.at),
+            )
+            cur.execute(
+                "UPDATE event_head SET next_seq=%s, head_hash=%s WHERE only_one",
+                (seq + 1, event.hash),
+            )
+            return event
 
     def load_events(self) -> EventLog:
         with self._cursor() as cur:

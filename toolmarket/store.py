@@ -21,7 +21,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from toolmarket.protocol.events import Event, EventLog
 from toolmarket.protocol.lineage import LineageGraph, LineageNode
@@ -158,6 +158,49 @@ class ResourceStore:
                  json.dumps(event.to_dict(), default=str), event.at),
             )
             self._conn.commit()
+
+    def reserve_event(
+        self, build: Callable[[int, Optional[str]], Event]
+    ) -> Event:
+        """Allocate `seq` and the chain head *from the table*, then seal and
+        insert — the `on_reserve` contract. See `PostgresStore.reserve_event`.
+
+        SQLite has no row to lock, so the serialization point is the write lock
+        itself, and it has to be taken before the read that decides the next
+        `seq`: a deferred transaction would read a head another writer is about
+        to move, which is the same TOCTOU the Postgres store closes with
+        `SELECT ... FOR UPDATE` on its head row.
+
+        The head is the last row rather than a counter beside it — the events
+        table already *is* the authority on what the last event was, and a second
+        place to keep it would be a second place to disagree.
+        """
+        with self._lock:
+            # A failed write above leaves SQLite's implicit transaction open;
+            # `BEGIN IMMEDIATE` inside one is an error, so clear it first.
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT seq, json FROM events ORDER BY seq DESC LIMIT 1"
+                ).fetchone()
+                if row is None:
+                    seq, prev = 0, None
+                else:
+                    seq, prev = row[0] + 1, json.loads(row[1]).get("hash")
+                event = build(seq, prev)
+                self._conn.execute(
+                    "INSERT INTO events(seq, resource_id, kind, json, at) "
+                    "VALUES(?,?,?,?,?)",
+                    (event.seq, event.resource_id, event.kind.value,
+                     json.dumps(event.to_dict(), default=str), event.at),
+                )
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+            return event
 
     def load_events(self) -> EventLog:
         with self._lock:
