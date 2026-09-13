@@ -409,6 +409,18 @@ STORE_OPERATIONS = METRICS.counter(
     "Persistence operations, by backend operation.",
     ("operation",),
 )
+# The gRPC surface is a second front door onto the same registry, so its calls
+# are counted in the same registry too. The label set mirrors HTTP_REQUESTS
+# (`route` is the RPC name, `status` the gRPC code) deliberately: an operator
+# reading a dashboard should not need two mental models for one substrate.
+# This counter is per-process, so it is only visible to the exposition of the
+# process that served the call — run the gRPC server and the API in one process
+# (`make grpc-dev`) if you want both protocols on one /metrics.
+GRPC_REQUESTS = METRICS.counter(
+    "toolmarket_grpc_requests_total",
+    "gRPC calls handled, by RPC name and canonical gRPC status code.",
+    ("rpc", "status"),
+)
 
 
 def render() -> str:

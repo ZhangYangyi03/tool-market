@@ -44,8 +44,12 @@ except Exception:  # noqa: BLE001 - API extras are optional
 
 from toolmarket import metrics as _metrics
 from toolmarket.cache import get_cache, resource_key
-from toolmarket.protocol.lifecycle import ResourceState, VersionStatus
-from toolmarket.protocol.resources import ResourceRecord, ToolContract
+from toolmarket.protocol.lifecycle import ResourceState, VersionStatus, parse_state
+from toolmarket.protocol.resources import (
+    ResourceRecord,
+    ToolContract,
+    compile_tool_fn,
+)
 from toolmarket.registry import ResourceRegistry
 from toolmarket.tasks import TaskState, TaskStore, make_queue
 
@@ -365,10 +369,17 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
     def do_transition(resource_id: str, req: "TransitionRequest") -> dict[str, Any]:
         if reg.get(resource_id) is None:
             raise HTTPException(404, f"unknown resource: {resource_id}")
+        # `parse_state`, not `ResourceState(req.to)`: the gRPC surface accepts
+        # "ACTIVE" and "active" alike, and a caller that gets a 409 over HTTP
+        # for a string the other door accepted would be looking at a rule that
+        # only exists because the two surfaces each did their own coercion.
+        # An unknown *name* is still 422 (bad request), not 409 (conflict):
+        # gRPC maps the same ValueError to INVALID_ARGUMENT, not
+        # FAILED_PRECONDITION, and the two must agree on which failure this is.
         try:
-            dst = ResourceState(req.to)
+            dst = parse_state(req.to)
         except ValueError as exc:
-            raise HTTPException(422, f"unknown state: {req.to}") from exc
+            raise HTTPException(422, str(exc)) from exc
         try:
             rec = reg.transition(resource_id, dst, reason=req.reason)
         except Exception as exc:  # LifecycleError
@@ -460,33 +471,11 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
     return app
 
 
-def _compile_fn(code: str, name: str) -> Any:
-    """Compile submitted code into a callable, if any, without executing it."""
-    if not code.strip():
-        def _noop(**kwargs: Any) -> str:
-            return f"{name}: no code registered"
-
-        return _noop
-    ns: dict[str, Any] = {}
-    try:
-        exec(compile(code, f"<tool:{name}>", "exec"), ns)  # noqa: S102
-    except Exception:  # noqa: BLE001 - a tool that will not compile is callable-nowhere
-        def _broken(**kwargs: Any) -> str:
-            return f"{name}: code failed to compile"
-
-        return _broken
-    # Prefer a function named after the tool, else the first callable defined.
-    fn = ns.get(name)
-    if callable(fn):
-        return fn
-    for key, val in ns.items():
-        if callable(val) and not key.startswith("_"):
-            return val
-
-    def _empty(**kwargs: Any) -> None:
-        return None
-
-    return _empty
+# The compiler moved to `toolmarket.protocol.resources.compile_tool_fn` when the
+# gRPC surface landed — two front doors, one compiler. Re-exported here under
+# its original private name so nothing that already spells it `_compile_fn`
+# breaks for the sake of a layering argument.
+_compile_fn = compile_tool_fn
 
 
 # Module-level app for `uvicorn toolmarket.api.main:app`.

@@ -26,6 +26,7 @@ and this module says so.
 from __future__ import annotations
 
 from enum import Enum
+from typing import Any
 
 
 class ResourceState(str, Enum):
@@ -79,6 +80,29 @@ LEGAL_TRANSITIONS: dict[ResourceState, frozenset[ResourceState]] = {
 
 class LifecycleError(ValueError):
     """Raised when a transition is asked for that the machine does not permit."""
+
+
+def parse_state(value: Any) -> ResourceState:
+    """Coerce an incoming state name to a ResourceState, case-insensitively.
+
+    Both front doors need this, which is why it lives here rather than in
+    either. A request that says "ACTIVE" and one that says "active" name the
+    same state, and the two doors must agree on that — if each did its own
+    `ResourceState(x)` the gRPC caller would get FAILED_PRECONDITION where the
+    HTTP caller got a success, for the same string in different capitalisation.
+
+    Raises ValueError (never LifecycleError) on an unknown name: this is a bad
+    argument, not an illegal transition, and both surfaces map it to their
+    "bad request" code rather than their "conflict" one.
+    """
+    if isinstance(value, ResourceState):
+        return value
+    text = str(value).strip()
+    lowered = text.lower()
+    for member in ResourceState:
+        if member.value == lowered or member.name.lower() == lowered:
+            return member
+    raise ValueError(f"unknown state: {text}")
 
 
 def can_transition(src: ResourceState, dst: ResourceState) -> bool:

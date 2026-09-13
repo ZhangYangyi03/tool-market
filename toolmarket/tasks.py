@@ -396,8 +396,34 @@ class CeleryQueue:
 
 
 def make_queue(registry: Any = None, kind: Optional[str] = None) -> Any:
-    """`TASK_QUEUE=celery` for a worker process; anything else runs inline."""
+    """`TASK_QUEUE=celery` for a worker process; anything else runs inline.
+
+    For the inline backend this is *not* a constructor — it is a getter. Asking
+    twice for the queue of one registry hands back the same object, and that
+    identity is the whole point.
+
+    The bug it fixes: the REST app and the gRPC server each call this for the
+    same registry, so a naive `return InlineQueue(registry)` gave a deployment
+    two independent queues over one substrate. An evolution submitted through
+    gRPC then returned a task id that `GET /tasks/{id}` answered 404 for — and
+    nothing about the failure pointed at the queue, it looked like the id was
+    wrong. A Celery queue is broker-backed and shares by construction; the
+    inline one has no broker, so the sharing has to be explicit.
+
+    Bound to the registry rather than keyed on a module global because the
+    registry *is* the substrate: two registries are two substrates and must get
+    two queues, which a global would get wrong in the other direction.
+    """
     choice = (kind or os.environ.get("TASK_QUEUE") or "inline").strip().lower()
     if choice in ("celery", "worker", "async"):
         return CeleryQueue()
-    return InlineQueue(registry=registry)
+    if registry is not None:
+        existing = getattr(registry, "task_queue", None)
+        if existing is not None:
+            return existing
+    queue = InlineQueue(registry=registry)
+    if registry is not None:
+        # Attached after construction: on the first call `task_queue` is None,
+        # which is exactly the "not built yet" answer the next caller needs.
+        registry.task_queue = queue
+    return queue

@@ -358,3 +358,45 @@ class ResourceRecord:
         self.version_current = nxt
         self.updated_at = time.time()
         return nxt
+
+
+# -- code, compiled once ----------------------------------------------------
+def compile_tool_fn(code: str, name: str) -> Any:
+    """Compile a contract's code into a callable, without executing it.
+
+    Lives here, beside the record, rather than beside a surface. It has two
+    callers — the REST route and the gRPC handler — and no owner; leaving it in
+    either one would make the other import a *surface* to get at a rule, which
+    is how two doors start to have two behaviours.
+
+    It never raises on bad code, deliberately. A contract whose body does not
+    compile is still a registerable resource: the contract is the interface, and
+    "the body is broken" is a fact about the tool, not grounds to refuse holding
+    it. The returned callable reports the failure when called, so `invoke` is
+    where the question "does this run" gets answered — and gets *logged*.
+    """
+    if not code.strip():
+        def _noop(**kwargs: Any) -> str:
+            return f"{name}: no code registered"
+
+        return _noop
+    ns: dict[str, Any] = {}
+    try:
+        exec(compile(code, f"<tool:{name}>", "exec"), ns)  # noqa: S102
+    except Exception:  # noqa: BLE001 - a tool that will not compile is callable-nowhere
+        def _broken(**kwargs: Any) -> str:
+            return f"{name}: code failed to compile"
+
+        return _broken
+    # Prefer a function named after the tool, else the first callable defined.
+    fn = ns.get(name)
+    if callable(fn):
+        return fn
+    for key, val in ns.items():
+        if callable(val) and not key.startswith("_"):
+            return val
+
+    def _empty(**kwargs: Any) -> None:
+        return None
+
+    return _empty

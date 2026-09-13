@@ -73,6 +73,9 @@ class ResourceRegistry:
             r.id: r for r in self.store.load_resources()
         }
         self._baselines: dict[str, Any] = {}
+        # Set by `make_queue` on first request, so every surface built over this
+        # registry shares one inline queue. None means "no queue asked for yet".
+        self.task_queue: Any = None
 
     # -- lazy autoforge wiring -------------------------------------------
     def _tools(self) -> Any:

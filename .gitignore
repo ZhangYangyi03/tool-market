@@ -22,3 +22,8 @@ experiments/results/_replay*/
 .env
 *.env
 !.env.example
+
+# Generated gRPC stubs. `python tools/grpc_gen.py` (or `make grpc-gen`) rebuilds
+# them from proto/toolmarket.proto; a committed stub drifts from its .proto the
+# first time someone edits one and forgets the other.
+toolmarket/grpc/gen/
