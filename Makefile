@@ -7,12 +7,45 @@ COMPOSE ?= docker compose
 IMAGE ?= toolmarket:local
 API_PORT ?= 8000
 
+# -- kubernetes -------------------------------------------------------------
+# One cluster per release name, so two releases cannot fight over node ports or
+# over the Postgres PVC. `kind` and `helm` are the real tools; every target
+# below is a thin wrapper so nothing here can drift from what the README says
+# to type.
+#
+# KUBECONFIG is repaired before use. Under git-bash it is exported as an MSYS
+# path (`/c/Users/.../.kube/config`), and the native kubectl.exe does not
+# understand that: it does not fail, it resolves to an empty config, so every
+# kubectl call reports "context does not exist" while the file sits right
+# there. Converting the one leading segment to the Windows form fixes it, and
+# is a no-op on Linux and macOS where KUBECONFIG is already correct.
+ifeq ($(OS),Windows_NT)
+ifneq (,$(findstring /c/,$(KUBECONFIG)))
+KUBECONFIG := $(subst /c/,C:/,$(KUBECONFIG))
+export KUBECONFIG
+endif
+endif
+K8S_CLUSTER ?= toolmarket
+K8S_NAMESPACE ?= toolmarket
+# Note: the chart's fullname resolves to the release name when the release name
+# already contains the chart name, so `tool-market` + `tool-market` gives the
+# service `tool-market-api`. Changing the release name changes that hostname.
+K8S_RELEASE ?= tool-market
+K8S_CONTEXT ?= kind-$(K8S_CLUSTER)
+# Deliberately not API_PORT. `docker compose up` publishes the API on API_PORT,
+# and if the k8s smoke reused it the port-forward would fail to bind while curl
+# quietly talked to the *compose* container -- a smoke test reporting on a stack
+# it was not asked to test. A separate port lets both run at once, which is also
+# how you compare them.
+K8S_PORT ?= 18000
+
 .PHONY: help install test lint check-config grpc-gen compose-up compose-obs compose-down \
         compose-logs smoke verify image psql redis-cli hf-deploy hf-deploy-docker \
-        render-init tf-init tf-plan tf-apply tf-ready tf-destroy clean
+        render-init tf-init tf-plan tf-apply tf-ready tf-destroy k8s-lint k8s-up \
+        k8s-status k8s-smoke k8s-down clean
 
 help:  ## list targets
-	@grep -E '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sed 's/:.*## /  - /'
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | sed 's/:.*## /  - /'
 
 install:  ## editable install with every backend
 	$(PY) -m pip install -e ".[all]"
@@ -88,6 +121,32 @@ tf-ready:  ## terraform: prove the stack found Postgres/Redis, not the fallbacks
 
 tf-destroy:  ## terraform: tear the stack down (base images are kept)
 	cd terraform && terraform destroy
+
+.PHONY: k8s-lint k8s-up k8s-status k8s-smoke k8s-down
+
+k8s-lint:  ## helm lint the chart and render every template (no cluster needed)
+	helm lint charts/tool-market
+	helm template $(K8S_RELEASE) charts/tool-market > /dev/null
+
+k8s-up:  ## kind cluster + helm install, running the same image as every other path
+	@docker image inspect $(IMAGE) > /dev/null 2>&1 || { echo "no image $(IMAGE) -- run 'make image' first"; exit 1; }
+	@kind get clusters 2>/dev/null | grep -qx '$(K8S_CLUSTER)' || kind create cluster --name $(K8S_CLUSTER)
+	kind load docker-image $(IMAGE) --name $(K8S_CLUSTER)
+	helm --kube-context $(K8S_CONTEXT) upgrade --install $(K8S_RELEASE) charts/tool-market \
+	  --namespace $(K8S_NAMESPACE) --create-namespace --wait --timeout 5m
+
+k8s-status:  ## what the cluster believes is running
+	kubectl --context $(K8S_CONTEXT) -n $(K8S_NAMESPACE) get deploy,po,svc,pvc
+
+k8s-smoke:  ## the same deploy/smoke.sh the compose stack passes, through a port-forward
+	@kubectl --context $(K8S_CONTEXT) -n $(K8S_NAMESPACE) port-forward svc/$(K8S_RELEASE)-api $(K8S_PORT):$(API_PORT) > /dev/null 2>&1 & \
+	  pf=$$!; trap 'kill $$pf 2>/dev/null' EXIT; \
+	  for _ in $$(seq 1 40); do curl -sf -o /dev/null http://127.0.0.1:$(K8S_PORT)/health && break; sleep 1; done; \
+	  BASE=http://127.0.0.1:$(K8S_PORT) ./deploy/smoke.sh
+
+k8s-down:  ## uninstall the release and delete the cluster; nothing stays resident
+	-helm --kube-context $(K8S_CONTEXT) uninstall $(K8S_RELEASE) --namespace $(K8S_NAMESPACE)
+	-kind delete cluster --name $(K8S_CLUSTER)
 
 clean:
 	rm -rf .pytest_cache **/__pycache__ *.egg-info build dist render.yaml
