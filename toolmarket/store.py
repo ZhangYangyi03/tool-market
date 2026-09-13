@@ -115,8 +115,12 @@ class ResourceStore:
 
     # -- events -----------------------------------------------------------
     def append_event(self, event: Event) -> None:
+        # A bare INSERT, not INSERT OR REPLACE: the log is append-only, so a
+        # duplicate `seq` is a fork (or a stale caller) and must raise rather
+        # than silently overwrite an event that is already sealed into the hash
+        # chain. This is the same contract the Postgres store keeps.
         self._conn.execute(
-            "INSERT OR REPLACE INTO events(seq, resource_id, kind, json, at) "
+            "INSERT INTO events(seq, resource_id, kind, json, at) "
             "VALUES(?,?,?,?,?)",
             (event.seq, event.resource_id, event.kind.value,
              json.dumps(event.to_dict(), default=str), event.at),

@@ -53,8 +53,7 @@ redis-cli:  ## a redis-cli shell
 	$(COMPOSE) exec redis redis-cli
 
 verify:  ## the live Postgres suite against the running stack
-	$(COMPOSE) exec -T -e TOOLMARKET_TEST_PG_DSN="postgresql://toolmarket:$$POSTGRES_PASSWORD@postgres:5432/toolmarket" \
-		api $(PY) -m pytest tests/test_store_pg.py -q -k Live
+	@./deploy/verify.sh
 
 smoke:  ## end-to-end against a running stack: health, ready, metrics, async
 	@./deploy/smoke.sh

@@ -12,10 +12,14 @@ Three differences from the SQLite store are deliberate:
   * `json` columns are **JSONB**, not TEXT. The substrate's records are queried,
     not just fetched (which resources are ACTIVE, which events belong to a
     resource), and JSONB makes that a database question instead of a Python one.
-  * `append_event` is `ON CONFLICT DO NOTHING`, not `DO UPDATE`. The event log is
-    append-only by contract; an "insert" that could rewrite an existing seq
-    would be a silent tamper path, and `verify_chain` would then be verifying
-    something nobody promised. A duplicate seq is a no-op, never a rewrite.
+  * `append_event` is a plain `INSERT`, with no `ON CONFLICT` clause at all. The
+    event log is append-only by contract, and *both* clauses are wrong here:
+    `DO UPDATE` would be a silent tamper path, and `DO NOTHING` would silently
+    drop a racing writer's event — the caller would be told it appended when it
+    did not, which is the same data loss with better manners. A duplicate `seq`
+    therefore raises `UniqueViolation`: the database refusing to fork the chain
+    or to lose an event from it. The SQLite store keeps the identical contract
+    with a bare `INSERT`.
   * `stats()["path"]` returns a **redacted DSN**. The SQLite store returns a file
     path because a file path cannot hold a password. A DSN can, and this dict is
     reachable from `GET /stats` — so the password is stripped here rather than
@@ -212,7 +216,7 @@ class PostgresStore:
         with self._cursor(commit=True) as cur:
             cur.execute(
                 "INSERT INTO events(seq, resource_id, kind, json, at) "
-                "VALUES(%s, %s, %s, %s::jsonb, %s) ON CONFLICT(seq) DO NOTHING",
+                "VALUES(%s, %s, %s, %s::jsonb, %s)",
                 (event.seq, event.resource_id, event.kind.value,
                  json.dumps(event.to_dict(), default=str), event.at),
             )

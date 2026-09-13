@@ -174,7 +174,6 @@ class ResourceRegistry:
             },
             actor=actor,
         )
-        self.store.append_event(self.log.tail(1)[0])
         return rec
 
     def transition(self, resource_id: str, dst: ResourceState, *,

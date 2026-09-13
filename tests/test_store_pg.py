@@ -176,7 +176,9 @@ class TestLivePostgres:
         return ResourceRecord(
             id=rid,
             type=ResourceType.TOOL,
-            contract=ToolContract(name="live", description="d", parameters={}),
+            name="live",
+            description="d",
+            contract=ToolContract(parameters={}),
         )
 
     def test_ping(self, store):
@@ -193,7 +195,8 @@ class TestLivePostgres:
         loaded = store.load_resource("tool:live")
         assert loaded is not None
         assert loaded.type == ResourceType.TOOL
-        assert loaded.contract.name == "live"
+        assert loaded.contract == rec.contract
+        assert loaded.name == "live"
         assert [r.id for r in store.load_resources()] == ["tool:live"]
 
     def test_missing_resource_is_none_not_an_exception(self, store):
@@ -202,9 +205,9 @@ class TestLivePostgres:
     def test_save_is_an_upsert(self, store):
         store.save_resource(self._record())
         rec = self._record()
-        rec.times_invoked = 7
+        rec.ledger = {"times_invoked": 7}
         store.save_resource(rec)
-        assert store.load_resource("tool:live").times_invoked == 7
+        assert store.load_resource("tool:live").ledger["times_invoked"] == 7
 
     def test_event_chain_round_trips_and_verifies(self, store):
         log = EventLog()
