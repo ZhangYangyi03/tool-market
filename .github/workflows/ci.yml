@@ -55,6 +55,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[all]"
 
+      # The stubs are generated, not committed, so this is a required build step
+      # rather than a convenience. Without it `tests/test_grpc_surface.py` fails
+      # at *collection* — its `import grpc` and its stub import are module-scope —
+      # which reports as one collection error and silently skips the whole
+      # surface, including the REST/gRPC agreement cases that are the only thing
+      # testing the two doors against each other.
+      - name: Generate gRPC stubs
+        run: python tools/grpc_gen.py
+
       - name: Test
         run: python -m pytest tests -q
 

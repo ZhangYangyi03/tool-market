@@ -7,7 +7,7 @@ COMPOSE ?= docker compose
 IMAGE ?= toolmarket:local
 API_PORT ?= 8000
 
-.PHONY: help install test lint check-config compose-up compose-obs compose-down \
+.PHONY: help install test lint check-config grpc-gen compose-up compose-obs compose-down \
         compose-logs smoke verify image psql redis-cli hf-deploy hf-deploy-docker \
         render-init tf-init tf-plan tf-apply tf-ready tf-destroy clean
 
@@ -16,6 +16,12 @@ help:  ## list targets
 
 install:  ## editable install with every backend
 	$(PY) -m pip install -e ".[all]"
+
+# Referenced by .gitignore, by tools/grpc_gen.py and by the error message in
+# toolmarket/grpc/server.py. It existed in all three places and in none of this
+# file until CI went red, which is the drift a doc-cited target is prone to.
+grpc-gen:  ## regenerate the gRPC stubs from proto/ (needs grpcio-tools)
+	$(PY) tools/grpc_gen.py
 
 test:  ## the whole suite (no server needed; the Postgres cases skip)
 	$(PY) -m pytest tests -q
