@@ -30,9 +30,8 @@ def _cmd_web(args: argparse.Namespace) -> int:
         print(
             "the console needs the api extra:\n"
             "    pip install 'tool-market[api]'\n"
-            "or, straight from the repository:\n"
-            "    uvx --from 'tool-market[api] @ git+https://github.com/"
-            "ZhangYangyi03/tool-market.git' tool-market web",
+            "or, without installing anything:\n"
+            "    uvx --from 'tool-market[api]' tool-market web",
             file=sys.stderr,
         )
         return 2

@@ -1,12 +1,12 @@
 name: reproduce
 
-# The README makes measured claims against a pinned engine commit. Running them
+# The README makes measured claims against a pinned engine release. Running them
 # here means a reader does not have to take the author's word for it on a
 # machine the author owns, and that a green suite cannot quietly depend on
 # local state that a fresh clone does not have.
 #
-# Free, and needs no secrets: the engine is fetched from a public repo at the
-# commit pyproject.toml pins, and `tools/check_pinned_engine.py` fails the build
+# Free, and needs no secrets: the engine is fetched from the index at the
+# release pyproject.toml pins, and `tools/check_pinned_engine.py` fails the build
 # if what arrived is not what was pinned.
 
 on:
@@ -33,7 +33,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev,api,grpc]"
 
-      - name: the installed engine is the commit the pin names
+      - name: the installed engine is the release the pin names
         run: python tools/check_pinned_engine.py
 
       # Same reason as in ci.yml: the stubs are generated, so a reproduction that
@@ -45,13 +45,18 @@ jobs:
       - name: substrate suite
         run: python -m pytest tests -q
 
-      - name: engine suite, at that same pinned commit
+      - name: engine suite, at that same pinned release
         run: |
-          sha=$(python -c "import re,pathlib;print(re.search(r'@([0-9a-f]{40})', pathlib.Path('pyproject.toml').read_text()).group(1))")
-          echo "engine commit under test: $sha"
+          ver=$(python -c "import re,pathlib;print(re.search(r'autoforge-agent==([0-9][0-9A-Za-z.\-]*)', pathlib.Path('pyproject.toml').read_text()).group(1))")
+          echo "engine release under test: $ver"
           mkdir -p /tmp/engine
           cd /tmp/engine
-          git clone --quiet https://github.com/ZhangYangyi03/autoforge.git .
-          git checkout --quiet "$sha"
+          # The sdist carries the engine's own suite; the wheel does not. Fetching
+          # the source rather than the built artifact is what lets one command
+          # both verify the release and run its tests -- with no git on the
+          # runner and no repo URL to keep in sync with a rename.
+          python -m pip download --quiet --no-deps --no-binary :all: "autoforge-agent==$ver" -d .
+          tar xzf "autoforge_agent-$ver.tar.gz"
+          cd "autoforge_agent-$ver"
           python -m pip install --quiet -e ".[dev]"
           python -m pytest tests -q

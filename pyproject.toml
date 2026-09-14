@@ -13,14 +13,16 @@ authors = [{ name = "Zhang Yangyi" }]
 keywords = ["agents", "tools", "protocol", "agp", "lifecycle", "provenance"]
 dependencies = [
     "pydantic>=2.0",
-    # The enforcement engine. Pinned to a git ref because the local sibling
-    # checkout is a dev convenience, not something a fresh clone has. Without
-    # this, `pip install -e .` succeeds and then every import of the validity
-    # gate fails -- which is exactly the failure this line exists to prevent.
-    # Pin the commit, not the branch: `@main` would silently re-fetch a newer
-    # engine and quietly invalidate the reproduction instructions in the
-    # README the next time someone ran them.
-    "autoforge @ git+https://github.com/ZhangYangyi03/autoforge.git@d53d3c5fa4dd617bb65857c390c0ac03edcb533e",
+    # The enforcement engine. Pinned to an exact release because the local
+    # sibling checkout is a dev convenience, not something a fresh clone has.
+    # Without this, `pip install -e .` succeeds and then every import of the
+    # validity gate fails -- which is exactly the failure this line exists to
+    # prevent.
+    # Pin the release, not the branch: `>=` or `@main` would silently fetch a
+    # newer engine and quietly invalidate the reproduction instructions in the
+    # README the next time someone ran them. A release also installs without
+    # git on the box, which a `git+https://` requirement does not.
+    "autoforge-agent==0.4.0",
 ]
 
 [project.optional-dependencies]
