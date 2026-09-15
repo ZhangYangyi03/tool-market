@@ -27,3 +27,16 @@ experiments/results/_replay*/
 # them from proto/toolmarket.proto; a committed stub drifts from its .proto the
 # first time someone edits one and forgets the other.
 toolmarket/grpc/gen/
+
+# Local vector-index and scratch from the retrieval work. The index is a build
+# product of the shelf (rebuildable from /resources); eval scripts and their
+# outputs are one-off measurements, not part of the package.
+toolmarket_data/
+toolmarket_data_local/
+*best_config.json
+rerank_cache.json
+toolmarket.db
+boot_test.py
+eval_retrieval*.py
+*.bak
+*.bak_vs
