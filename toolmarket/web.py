@@ -183,12 +183,25 @@ async function list(selected) {
 
 async function show(id) {
   list(id);
-  const [r, lin] = await Promise.all([
+  // The trust view is fetched defensively. The console is also pointed at
+  // deployments whose API predates the route, and a 404 there should cost one
+  // panel rather than blank the whole page -- which is what an unguarded
+  // Promise.all would do, since it rejects the entire render on any member.
+  const [r, lin, tr] = await Promise.all([
     api("/resources/" + rid(id)),
     api("/resources/" + rid(id) + "/lineage"),
+    api("/resources/" + rid(id) + "/trust").catch(() => null),
   ]);
   const ev = await api("/resources/" + rid(id) + "/events");
   const inv = (r.contract && r.contract.invariances) || [];
+  const tcls = tr ? ({ promote: "active", quarantine: "quarantined" }[tr.action] || "draft") : "";
+  const tblock = tr ? `
+    <h2>Trust <span class="muted">· what the ledger earns</span></h2>
+    <div class="kv"><span class="k">decision</span><code><span class="badge s-${tcls}" style="margin-top:0">${esc(tr.action)}</span>${tr.to ? " &rarr; " + esc(tr.to) : ""}</code></div>
+    <div class="kv"><span class="k">reason</span><code>${esc(tr.reason)}</code></div>
+    <div class="kv"><span class="k">evidence</span><code>calls ${esc(tr.evidence.calls)} · success ${esc(tr.evidence.success_rate)} · consecutive failures ${esc(tr.evidence.consecutive_failures)}</code></div>
+    <div class="kv"><span class="k">the bar</span><code>${tr.thresholds ? `calls &ge; ${esc(tr.thresholds.min_calls)} · success &ge; ${esc(tr.thresholds.min_success_rate)} · consecutive failures = 0` : "—"}</code></div>`
+    : `<h2>Trust</h2><div class="empty">trust view unavailable on this API</div>`;
   $("detail").innerHTML = `
     <h2>${esc(r.name)} <span class="badge s-${esc(r.state)}">${esc(r.state)}</span></h2>
     <div class="kv"><span class="k">id</span><code>${esc(r.id)}</code></div>
@@ -197,6 +210,7 @@ async function show(id) {
     <div class="kv"><span class="k">invariances</span><code>${esc(inv.join(", ") || "—")}</code></div>
     <div class="kv"><span class="k">source</span><code>${esc(r.provenance && r.provenance.source || "—")}</code></div>
     <div class="kv"><span class="k">ledger</span><code>calls ${r.ledger ? r.ledger.calls : 0} · success ${r.ledger ? r.ledger.success_rate : "—"}</code></div>
+${tblock}
 
     <h2>Invoke</h2>
     <div class="row">

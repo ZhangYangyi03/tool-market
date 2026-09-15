@@ -26,6 +26,7 @@ from toolmarket.protocol.lifecycle import (
 )
 from toolmarket.protocol.lineage import LineageGraph, LineageNode
 from toolmarket.protocol.resources import ResourceRecord, ToolContract
+from toolmarket.trust import TRUST_ACTOR, TrustDecision, TrustPolicy, assess
 
 try:  # pragma: no cover
     from autoforge.tools.registry import ToolRegistry, ToolResult
@@ -57,6 +58,7 @@ class ResourceRegistry:
         tool_registry: Any = None,
         log: Optional[EventLog] = None,
         lineage: Optional[LineageGraph] = None,
+        trust_policy: Optional[TrustPolicy] = None,
     ) -> None:
         from toolmarket.store import make_store
 
@@ -87,6 +89,15 @@ class ResourceRegistry:
         # Set by `make_queue` on first request, so every surface built over this
         # registry shares one inline queue. None means "no queue asked for yet".
         self.task_queue: Any = None
+        # The `earn`/`decay` edges of the lifecycle (`toolmarket/trust.py`).
+        # Default ON, because the alternative is what this shelf looked like
+        # without it: every tool published, none ever promoted, and the only two
+        # resources that reached ACTIVE got there through a human's keyboard with
+        # an empty `reason`. Pass `TrustPolicy(enabled=False)` to keep the ledger
+        # as a record that nothing acts on.
+        self.trust: TrustPolicy = (
+            trust_policy if trust_policy is not None else TrustPolicy()
+        )
 
     # -- lazy autoforge wiring -------------------------------------------
     def _tools(self) -> Any:
@@ -295,6 +306,21 @@ class ResourceRegistry:
         if existing is not None and fn is None:
             spec.fn = existing.fn
             spec.runner = getattr(existing, "runner", None)
+        # Last resort, and the one that makes a restart survivable: recompile
+        # the callable from the stored contract. Without this, `fn` is None for
+        # every resource loaded from a durable store, because a function object
+        # cannot be serialised into the record -- only its source can. The
+        # symptom is a shelf that lists correctly and answers every invoke with
+        # "TypeError: 'NoneType' object is not callable", which reads like a
+        # broken tool rather than a lost one.
+        #
+        # `compile_tool_fn` never raises on bad code; it returns a callable that
+        # reports the failure when called, so a resource whose body does not
+        # compile stays registered and its invoke is logged like any other.
+        if spec.fn is None and rec.contract.code:
+            from toolmarket.protocol.resources import compile_tool_fn
+
+            spec.fn = compile_tool_fn(rec.contract.code, rec.name)
         return spec
 
     def baseline_for(self, resource_id: str) -> Any:
@@ -349,11 +375,64 @@ class ResourceRegistry:
                   "error": getattr(result, "error", None)},
             actor=actor,
         )
+        # The `earn` edge, taken here rather than in a cron or a sweep. The
+        # ledger was updated one statement ago, so this is the only moment the
+        # decision is a function of data that is actually fresh; a scheduled
+        # sweep would promote on the same numbers, just later and with no way to
+        # say which call tipped it. Best-effort and swallowed: a shelf that
+        # refuses a transition must never turn a successful call into a failed
+        # one, which is the same contract `_invalidate` and the event sink's
+        # durability already work under.
+        try:
+            self.reconcile_trust(rec.id)
+        except Exception:  # noqa: BLE001 - see comment
+            pass
         return result
 
     def _spec_ledger(self, rec: ResourceRecord) -> dict[str, Any]:
         spec = self._tools().get(rec.name)
         return spec.stats.to_dict() if spec is not None and hasattr(spec, "stats") else rec.ledger
+
+    # -- trust ------------------------------------------------------------
+    def trust_view(self, resource_id: str) -> dict[str, Any]:
+        """What the policy makes of this resource right now — changing nothing.
+
+        Read-only on purpose. The console calls this while rendering a resource,
+        and an assessment that moved state would make opening a page a
+        side-effecting act -- the same reason `chips()` gathers its counts from
+        current state instead of incrementing counters.
+        """
+        rec = self.require(resource_id)
+        return assess(rec.id, rec.state, rec.ledger, self.trust).to_dict(
+            self.trust.thresholds())
+
+    def reconcile_trust(self, resource_id: str) -> Optional[TrustDecision]:
+        """Apply the policy to one resource; returns the decision either way.
+
+        The decision is returned even when nothing moved, so a caller sweeping
+        the shelf can print the reason a tool is still on probation instead of
+        collecting a list of unexplained silences.
+        """
+        rec = self.require(resource_id)
+        decision = assess(rec.id, rec.state, rec.ledger, self.trust)
+        if decision.action == "hold" or not self.trust.enabled:
+            return decision
+        # Through `transition`, not by writing `rec.state`, so a policy-driven
+        # move leaves exactly the audit trail a hand-typed one does -- and one
+        # better: `TRUST_ACTOR` names the decider instead of "system", and the
+        # reason carries the evidence that earned it.
+        self.transition(resource_id, ResourceState(decision.to),
+                        reason=decision.reason, actor=TRUST_ACTOR)
+        return decision
+
+    def reconcile_all(self) -> list[dict[str, Any]]:
+        """Sweep the whole shelf and report every decision, applied or not."""
+        out: list[dict[str, Any]] = []
+        for rec in self.list():
+            decision = self.reconcile_trust(rec.id)
+            if decision is not None:
+                out.append(decision.to_dict(self.trust.thresholds()))
+        return out
 
     # -- views ------------------------------------------------------------
     def event_log(self, resource_id: Optional[str] = None) -> list[dict[str, Any]]:

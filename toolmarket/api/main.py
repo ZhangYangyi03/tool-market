@@ -16,6 +16,7 @@ decided a resource's state by itself would be a second, unaudited state machine.
     POST /resources/{id}/invoke
     GET  /resources/{id}/lineage
     GET  /resources/{id}/events
+    GET  /resources/{id}/trust             what the ledger earns it, and why
     POST /resources/{id}/evolve       the SEPL closed loop (propose→assess→commit)
     POST /resources/{id}/evolve/async same, but returns a task id immediately
     GET  /tasks/{task_id}             poll an async evolution
@@ -344,6 +345,21 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
         rows = reg.event_log(resource_id)
         return {"resource_id": resource_id, "count": len(rows),
                 "events": rows[-limit:]}
+
+    @app.get("/resources/{resource_id:path}/trust")
+    def resource_trust(resource_id: str) -> dict[str, Any]:
+        """Should this be ACTIVE? Answered with the evidence, not a verdict.
+
+        GET, and read-only: the policy is applied on `invoke` (the moment the
+        ledger moves) and can be swept by `tool-market trust --apply`, but a read
+        never moves a resource. The route exists so the answer is *inspectable* --
+        an operator asking why a well-behaved tool is still on probation gets the
+        failing precondition and the thresholds it was measured against, rather
+        than the empty `reason` string the manual transitions used to leave.
+        """
+        if reg.get(resource_id) is None:
+            raise HTTPException(404, f"unknown resource: {resource_id}")
+        return reg.trust_view(resource_id)
 
     @app.get("/resources/{resource_id:path}")
     def get_resource(resource_id: str, fresh: bool = False) -> dict[str, Any]:
