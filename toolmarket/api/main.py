@@ -21,6 +21,7 @@ decided a resource's state by itself would be a second, unaudited state machine.
     POST /resources/{id}/evolve       the SEPL closed loop (propose→assess→commit)
     POST /resources/{id}/evolve/async same, but returns a task id immediately
     GET  /tasks/{task_id}             poll an async evolution
+    POST /mcp                         MCP (JSON-RPC 2.0): tools/list, tools/call
 
 Two things the routes do *not* do, deliberately: they never advance a state, and
 they never write an event. Both belong to the registry.
@@ -599,6 +600,15 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
         payload["terminal"] = rec.state in (TaskState.SUCCESS.value,
                                            TaskState.FAILURE.value)
         return payload
+
+    # The MCP front door. Mounted here rather than in `served_app` so the bare
+    # app -- which is what the console mounts under /api -- speaks it too, and a
+    # client that finds one surface finds the other at the same path. The facade
+    # holds no state of its own: every call it serves goes through `reg`, the
+    # same object the REST routes use.
+    from toolmarket import mcp_facade
+
+    mcp_facade.install(app, reg)
 
     return app
 
