@@ -76,6 +76,16 @@ if _HAVE_FASTAPI:
         tags: list[str] = Field(default_factory=list)
         enable_evolving: bool = True
         permission_mode: str = "workspace_write"
+        # Where this came from. Without these two, anything registered through
+        # this route is provenance-less by construction, and a caller that
+        # imports a hundred resources from somewhere else cannot say where --
+        # which is exactly the property the importer is careful about.
+        provenance: dict[str, Any] = Field(default_factory=dict)
+        metadata: dict[str, Any] = Field(default_factory=dict)
+
+    class DiscoverRequest(BaseModel):
+        q: str
+        limit: int = 25
 
     class TransitionRequest(BaseModel):
         to: str
@@ -429,6 +439,13 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
             raise HTTPException(409, str(exc)) from exc
         rec.enable_evolving = req.enable_evolving
         rec.permission_mode = req.permission_mode
+        if req.provenance:
+            # Merge, do not overwrite: `reg.register` has already stamped
+            # source/generator from the spec, and those are the authoritative
+            # ones. The caller adds to that, it does not replace it.
+            rec.provenance.update(req.provenance)
+        if req.metadata:
+            rec.metadata.update(req.metadata)
         reg.save(rec)
         try:
             app.state.search.index_text(
@@ -437,6 +454,78 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
         except Exception:
             pass
         return _record_view(rec)
+
+    @app.post("/discover")
+    def discover(req: "DiscoverRequest") -> dict[str, Any]:
+        """Go upstream to the public MCP registry when the shelf has nothing.
+
+        This is the difference between a shelf and a library card. `/search`
+        ranks *what we already hold* -- on 2026-09-17 that was 153 resources,
+        all forged here or pushed by a sibling agent, so a need outside that set
+        used to be answered with "nothing on the shelf" and nothing more. The
+        public registry holds thousands of servers and is searchable
+        server-side, so an unmatched need is one page away from an answer.
+
+        POST, not GET, and deliberately: this *registers* what it finds (as
+        DRAFT), and a GET that mutates the shelf is a trap for every retrying
+        client and every crawler.
+
+        `found` (what the registry knows) and `inserted` (new here) are separate
+        numbers, so `inserted == 0` with `found > 0` reads correctly as "we
+        already hold these" rather than as a miss -- the next step in that case
+        is `/search`, not `/discover`.
+
+        What it never does: promote. Everything lands DRAFT; remote entries get
+        a contract that can really call the server, package-only entries get an
+        empty contract marked `unbound`. See `toolmarket.mcp_import` for why.
+        """
+        if not req.q.strip():
+            raise HTTPException(422, "q is required")
+        if os.environ.get("TOOLMARKET_DISCOVER", "on").lower() in ("0", "false", "off"):
+            return {"query": req.q, "enabled": False, "found": 0, "inserted": 0,
+                    "results": [],
+                    "note": "upstream discovery is disabled by TOOLMARKET_DISCOVER"}
+        from toolmarket import mcp_import
+
+        limit = max(1, min(int(req.limit or 25), 100))
+        # Bounded for an interactive path: two attempts at 15s, not the bulk
+        # importer's three at 25s. A caller waiting on a forge is owed a fast
+        # failure it can report, not the best possible answer eventually.
+        rep = mcp_import.find_servers(
+            reg, req.q, limit=limit,
+            fetch=lambda cursor=None, limit=limit, **kw: mcp_import.fetch_page(
+                cursor, limit=limit, attempts=2, timeout=15.0, **kw))
+
+        results = []
+        for resource_id in rep.get("ids", [])[:limit]:
+            rec = reg.get(resource_id)
+            if rec is None:
+                continue
+            # Index it, the same way `register` does. Without this the resources
+            # are on the shelf but invisible to `/search` -- measured: 8 found,
+            # 8 inserted, and `/search` still returned 0. A discovery path whose
+            # results the next lookup cannot see is a path that found nothing.
+            try:
+                app.state.search.index_text(
+                    "tools", rec.id, _vs.build_resource_text(_record_view(rec)),
+                    {"name": rec.name, "state": rec.state.value})
+            except Exception:
+                pass
+            results.append({
+                "resource_id": rec.id, "name": rec.name,
+                "state": rec.state.value,
+                "callable": bool((rec.metadata or {}).get("callable")),
+                "requires_launch": bool((rec.metadata or {}).get("requires_launch")),
+                "description": (rec.description or "")[:200],
+                "origin": (rec.provenance or {}).get("origin_name"),
+                "remotes": (rec.provenance or {}).get("remotes") or [],
+            })
+        return {"query": req.q, "enabled": True, "found": rep.get("found", 0),
+                "entries": rep.get("entries", 0),
+                "inserted": rep.get("inserted", 0), "error": rep.get("error"),
+                "count": len(results), "results": results,
+                "note": ("hit the shelf already held" if results
+                         and rep.get("inserted") == 0 else "")}
 
     @app.get("/resources/{resource_id:path}/lineage")
     def lineage(resource_id: str) -> dict[str, Any]:

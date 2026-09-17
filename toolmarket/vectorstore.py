@@ -60,15 +60,43 @@ CREATE INDEX IF NOT EXISTS idx_lexical_collection ON lexical(collection);
 
 
 def tokenize(text):
-    """Lowercase word tokens plus single CJK characters."""
+    """Lowercase word tokens plus single CJK characters.
+
+    An identifier is also emitted as its parts. `mcp_x_pdf_merge` is one word to
+    `_WORD`, so it tokenized to a single opaque term and a query for `pdf` shared
+    nothing with it -- BM25 scored 0 and, on a shelf reached without the embedder
+    (a second process, a rebuilt index), search returned nothing for a document
+    that was sitting right there. Measured 2026-09-17: resource
+    `mcp_x_pdf_merge`, query `pdf merge`, `bm25_search` -> [].
+
+    The stem is kept as well as the parts, so an exact-name query (`mcp_x_pdf_merge`
+    typed in full) still ranks above the generic `merge`. Duplicates are dropped
+    because token frequency is what the scorer reads.
+    """
     if not text:
         return []
     low = str(text).lower()
-    return _WORD.findall(low) + _CJK.findall(low)
+    out = _WORD.findall(low)
+    for word in list(out):
+        if "_" in word:
+            parts = [p for p in word.split("_") if p]
+            if len(parts) > 1:
+                out.extend(parts)
+    out.extend(_CJK.findall(low))
+    return out
+
+
+# Bump when `tokenize` changes what a document becomes. The stored row holds a
+# *pre-computed term frequency*, not the text, so a tokenizer fix does not reach
+# documents already indexed: they keep the old tokens and stay wrong, silently,
+# while every hash comparison says they are current. Versioning the hash is what
+# turns that into a reindex.
+TOKENIZER_VERSION = 2
 
 
 def hash_text(text):
-    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256(
+        ("%d:%s" % (TOKENIZER_VERSION, text or "")).encode("utf-8")).hexdigest()[:16]
 
 
 def pack_vector(vec):
