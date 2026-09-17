@@ -198,3 +198,83 @@ def test_empty_registry_is_not_an_error(reg):
     rep = imp.import_servers(reg, fetch=fetch)
     assert rep == {**rep, "inserted": 0, "seen": 0, "exhausted": True,
                    "errors": []}
+
+
+# -- on-demand lookup -------------------------------------------------------
+def test_search_registers_hits_and_reports_already_present_ones(reg):
+    """A query whose hits are all already on the shelf is a success.
+
+    `found` and `inserted` are separate numbers for this reason: an agent told
+    "0 inserted" would conclude we have nothing, when the truth is we have it
+    and it was cheap to confirm.
+    """
+    hits = [_entry("s/pdf", url="https://p.example/mcp", desc="pdf tools"),
+            _entry("s/other", url="https://o.example/mcp")]
+    fetch, calls = _pager([{"servers": hits}])
+    rep = imp.find_servers(reg, "pdf", fetch=fetch)
+    assert rep["found"] == 2 and rep["inserted"] == 2 and rep["error"] is None
+    assert rep["entries"] == 2
+    assert calls["n"] == 1, "a lookup is one page, not a walk"
+    again_fetch, _ = _pager([{"servers": hits}])
+    rep2 = imp.find_servers(reg, "pdf", fetch=again_fetch)
+    assert rep2["found"] == 2 and rep2["inserted"] == 0
+    assert len(reg.list()) == 2
+
+
+def test_search_passes_the_term_to_the_registry_not_a_local_filter():
+    seen = {}
+
+    def fetch(cursor=None, **kw):
+        seen.update(kw)
+        return {"servers": [], "metadata": {}}
+
+    imp.find_servers(None, "pdf", fetch=fetch)
+    assert seen.get("search") == "pdf"
+
+
+def test_fetch_page_puts_search_in_the_query_string():
+    import urllib.request as ur
+    captured = {}
+    real = ur.urlopen
+
+    class _Resp:
+        def read(self):
+            return b'{"servers": [], "metadata": {}}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake(req, timeout=None):
+        captured["url"] = getattr(req, "full_url", req)
+        return _Resp()
+
+    ur.urlopen = fake
+    try:
+        imp.fetch_page(search="pdf and tools", sleep=lambda _s: None)
+    finally:
+        ur.urlopen = real
+    assert "search=pdf+and+tools" in captured["url"] or \
+           "search=pdf%20and%20tools" in captured["url"]
+
+
+def test_search_failure_is_reported_not_raised(reg):
+    fetch, _ = _pager([{"_error": "TimeoutError: read timed out"}])
+    rep = imp.find_servers(reg, "pdf", fetch=fetch)
+    assert rep["found"] == 0 and "timed out" in rep["error"]
+    assert len(reg.list()) == 0
+
+
+def test_search_counts_distinct_resources_not_version_rows(reg):
+    """`found` must be actionable: the id list and the count must agree."""
+    rows = [_entry("s/pdf", version="1.0.0", url="https://p.example/mcp"),
+            _entry("s/pdf", version="2.0.0", url="https://p.example/mcp"),
+            _entry("s/pdf", version="3.0.0", url="https://p.example/mcp"),
+            _entry("s/other", url="https://o.example/mcp")]
+    fetch, _ = _pager([{"servers": rows}])
+    rep = imp.find_servers(reg, "pdf", fetch=fetch)
+    assert rep["entries"] == 4
+    assert rep["found"] == 2 and len(rep["ids"]) == 2
+    assert rep["inserted"] == 2

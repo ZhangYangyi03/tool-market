@@ -211,12 +211,21 @@ def to_record(entry: dict[str, Any]) -> Optional[ResourceRecord]:
 
 def fetch_page(cursor: Optional[str] = None, limit: int = PAGE_LIMIT,
                url: str = REGISTRY_URL, timeout: float = FETCH_TIMEOUT,
-               attempts: int = FETCH_ATTEMPTS,
+               attempts: int = FETCH_ATTEMPTS, search: Optional[str] = None,
                sleep: Callable[[float], None] = time.sleep) -> dict[str, Any]:
-    '''One page, with backoff retries. A dict with `_error` when all failed.'''
+    '''One page, with backoff retries. A dict with `_error` when all failed.
+
+    `search` is server-side: measured 2026-09-17, `?search=pdf` returned pdf
+    servers while `?q=` and `?query=` were ignored. It is what makes looking
+    something up on demand affordable -- one page instead of a ten-thousand
+    entry walk, which is the difference between "ask the registry when you need
+    something" and "mirror the registry every night".
+    '''
     last: Optional[Exception] = None
     for attempt in range(attempts):
         target = f"{url}?limit={int(limit)}"
+        if search:
+            target += "&search=" + urllib.parse.quote(str(search))
         if cursor:
             target += "&cursor=" + urllib.parse.quote(cursor)
         try:
@@ -300,6 +309,46 @@ def import_servers(reg: Any, *, limit: int = 0, cursor: Optional[str] = None,
             "partial_page": partial_page, "errors": errors}
 
 
+def find_servers(reg: Any, query: str, *, limit: int = 25,
+                 fetch: Callable[..., dict[str, Any]] = fetch_page,
+                 log: Callable[[str], None] = lambda _m: None) -> dict[str, Any]:
+    '''Search the registry by keyword and register the hits. Returns the ids.
+
+    This is the on-demand half. A full import is a mirror: it only knows what
+    existed the day it ran. A search is a lookup, and it is the reason an agent
+    can be told "when you need a tool, go and look" without that being a promise
+    to re-read the internet every time.
+
+    It reports `found` and `inserted` separately, because a query whose hits are
+    all already on the shelf is a success and must not read like a failure.
+    '''
+    page = fetch(limit=limit, search=query)
+    if page.get("_error"):
+        return {"query": query, "found": 0, "entries": 0, "inserted": 0,
+                "ids": [], "error": page["_error"]}
+    entries = inserted = 0
+    ids: list[str] = []
+    for item in page.get("servers") or []:
+        rec = to_record((item or {}).get("server") or {})
+        if rec is None:
+            continue
+        # The registry returns one row per version, so the same server arrives
+        # several times. `entries` is the raw row count; `found` is distinct
+        # resources, which is the number a caller can act on -- "found 25" next
+        # to a list of 16 ids is the kind of arithmetic a caller has to redo.
+        entries += 1
+        if rec.id in ids:
+            continue
+        ids.append(rec.id)
+        if reg.get(rec.id) is None:
+            reg.save(rec)
+            inserted += 1
+    found = len(ids)
+    log(f"search {query!r}: {entries} rows, {found} distinct, inserted {inserted}")
+    return {"query": query, "found": found, "entries": entries,
+            "inserted": inserted, "ids": ids, "error": None}
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     import argparse
 
@@ -312,6 +361,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--pages", type=int, default=0,
                    help="stop after this many registry pages (0 = no limit)")
     p.add_argument("--cursor", default=None, help="resume from this cursor")
+    p.add_argument("--search", default=None,
+                   help="look up a keyword instead of walking the registry, "
+                        "and register whatever it returns")
     p.add_argument("--store", default=None,
                    help="store URL; defaults to TOOLMARKET_STORE")
     args = p.parse_args(argv)
@@ -320,8 +372,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     from toolmarket.store import make_store
 
     reg = ResourceRegistry(make_store(args.store) if args.store else make_store())
-    report = import_servers(reg, limit=args.limit, cursor=args.cursor,
-                            pages=args.pages, log=lambda m: print(m, flush=True))
+    if args.search:
+        report = find_servers(reg, args.search, limit=args.limit or 25,
+                              log=lambda m: print(m, flush=True))
+    else:
+        report = import_servers(reg, limit=args.limit, cursor=args.cursor,
+                                pages=args.pages,
+                                log=lambda m: print(m, flush=True))
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
 
