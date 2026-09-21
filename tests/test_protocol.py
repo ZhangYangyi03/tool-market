@@ -79,8 +79,25 @@ def test_legal_and_illegal_transitions():
         transition(ResourceState.ACTIVE, ResourceState.ACTIVE)
 
 
-def test_retired_is_terminal():
-    assert LEGAL_TRANSITIONS[ResourceState.RETIRED] == frozenset()
+def test_retired_is_not_a_one_way_door():
+    """RETIRED has exactly one way out, and it is the documented one.
+
+    This asserted ``== frozenset()`` -- "retired is terminal" -- while the
+    module's own state diagram draws ``retired --restore--> PROBATION`` and the
+    table below it implements the back-edge. The test had been red since at
+    least 9f23c3e (2026-09-15), which is why nobody noticed the two disagreed:
+    an always-red test is read as "this file is broken", not as "the machine
+    changed".
+
+    Named for what the code actually promises rather than for terminality: a
+    restore is a real operation (the recycle bin a retired tool goes to), and
+    the invariant worth pinning is that it goes to PROBATION -- re-earning
+    trust -- and never straight back to ACTIVE.
+    """
+    assert LEGAL_TRANSITIONS[ResourceState.RETIRED] == frozenset({
+        ResourceState.PROBATION,
+    })
+    assert not can_transition(ResourceState.RETIRED, ResourceState.ACTIVE)
 
 
 def test_version_status_has_exactly_three_states():

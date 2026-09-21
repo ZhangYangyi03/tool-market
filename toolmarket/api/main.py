@@ -39,7 +39,7 @@ import os
 from typing import Any, Optional
 
 try:
-    from fastapi import FastAPI, HTTPException
+    from fastapi import FastAPI, HTTPException, Request
     from pydantic import BaseModel, Field
     _HAVE_FASTAPI = True
 except Exception:  # noqa: BLE001 - API extras are optional
@@ -153,6 +153,67 @@ def _startup_sync(store, reg) -> None:
     import logging
     logging.getLogger("toolmarket.search").info(
         "search index ready: %s (dense %s, model %s)", report, bool(dim), model)
+
+
+def _trusted_proxies() -> set:
+    """The addresses whose ``X-Actor`` header is allowed to be believed.
+
+    Default: loopback only. The shelf is usually reached through the node's
+    reverse proxy or a tunnel, and through a proxy every caller arrives from the
+    proxy's own address -- so without this list the actor header is a way to
+    write someone else's name into the audit trail for anyone who can reach the
+    port. The header is *provenance*, not authentication: it says who the caller
+    says it is, and it is believed only from a machine the operator runs.
+
+    Set ``TOOLMARKET_TRUSTED_PROXIES=192.168.1.107,10.0.0.5`` when the peer
+    machines reach this shelf through their own node proxies.
+    """
+    raw = os.environ.get("TOOLMARKET_TRUSTED_PROXIES")
+    if raw is None:
+        # "testclient" is not a spoofable name: it is the address FastAPI's
+        # in-process ASGI transport reports, i.e. this same process. Without it
+        # every test that sets a header asserted the fallback instead of the
+        # behaviour, and the behaviour would then be untested in exactly the
+        # configuration the tests run in.
+        return {"127.0.0.1", "::1", "localhost", "testclient"}
+    return {x.strip() for x in raw.split(",") if x.strip()}
+
+
+def _caller(request: Any) -> str:
+    """Who is making this call, as best the shelf can honestly say.
+
+    Every event on a live shelf used to carry ``actor="system"`` -- not a
+    decision, a default nobody overrode. So "who put this here" was
+    unanswerable, and a bad tool's origin could not be traced to a peer or to a
+    person. Measured on 2026-09-21 by reading /events on both machines: every
+    row said "system", including rows caused by an agent on the other host.
+
+    The answer, in order of how much it is worth:
+
+      the X-Actor header, if the caller is a trusted proxy and the value is a
+      plain identifier (peers and the MCP client send their label here);
+      else the X-Peer label such a proxy sets;
+      else the TCP address the connection actually came from -- weak, but true,
+      and enough to tell this host from a sibling;
+      else "system", which now means exactly what it says: a caller with no
+      identifiable origin at all.
+    """
+    try:
+        client = getattr(request, "client", None)
+        peer_ip = getattr(client, "host", "") or ""
+    except Exception:                                          # noqa: BLE001
+        peer_ip = ""
+    if peer_ip in _trusted_proxies():
+        for header in ("x-actor", "x-peer"):
+            value = ""
+            try:
+                value = (request.headers.get(header) or "").strip()
+            except Exception:                                  # noqa: BLE001
+                value = ""
+            if value and len(value) <= 64 and all(
+                    c.isalnum() or c in "-_.:@ " for c in value):
+                return value
+    return peer_ip or "system"
 
 
 def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
@@ -413,7 +474,7 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
                 "count": len(results), "results": results}
 
     @app.post("/resources", status_code=201)
-    def register(req: "RegisterRequest") -> dict[str, Any]:
+    def register(req: "RegisterRequest", request: Request) -> dict[str, Any]:
         # Build an autoforge ToolSpec so enforcement has something real to run.
         try:
             from autoforge.tools.spec import ToolSpec
@@ -434,7 +495,7 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
             tags=list(req.tags),
         )
         try:
-            rec = reg.register(spec)
+            rec = reg.register(spec, actor=_caller(request))
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
         rec.enable_evolving = req.enable_evolving
@@ -588,7 +649,8 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
         return view
 
     @app.post("/resources/{resource_id:path}/transition")
-    def do_transition(resource_id: str, req: "TransitionRequest") -> dict[str, Any]:
+    def do_transition(resource_id: str, req: "TransitionRequest",
+                      request: Request) -> dict[str, Any]:
         if reg.get(resource_id) is None:
             raise HTTPException(404, f"unknown resource: {resource_id}")
         # `parse_state`, not `ResourceState(req.to)`: the gRPC surface accepts
@@ -603,16 +665,19 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
         try:
-            rec = reg.transition(resource_id, dst, reason=req.reason)
+            rec = reg.transition(resource_id, dst, reason=req.reason,
+                                 actor=_caller(request))
         except Exception as exc:  # LifecycleError
             raise HTTPException(409, str(exc)) from exc
         return _record_view(rec)
 
     @app.post("/resources/{resource_id:path}/invoke")
-    def do_invoke(resource_id: str, req: "InvokeRequest") -> dict[str, Any]:
+    def do_invoke(resource_id: str, req: "InvokeRequest",
+                  request: Request) -> dict[str, Any]:
         if reg.get(resource_id) is None:
             raise HTTPException(404, f"unknown resource: {resource_id}")
-        result = reg.invoke(resource_id, req.arguments, force=req.force)
+        result = reg.invoke(resource_id, req.arguments, force=req.force,
+                            actor=_caller(request))
         return {
             "resource_id": resource_id,
             "ok": bool(getattr(result, "ok", True)),
