@@ -300,7 +300,7 @@ pip install -e ../autoforge     # the enforcement engine
 pip install -e .                # this substrate
 
 python examples/demo_evolution.py      # end-to-end, incl. a veto you can see
-python -m pytest -q                    # 142 collected; 10 skip without Postgres
+python -m pytest -q                    # 150 collected; 10 skip without Postgres
 ```
 
 The whole stack — API, worker, database, cache, and optionally Prometheus and
@@ -342,6 +342,34 @@ python -m uvicorn toolmarket.api.main:served_app --port 8777
 | `GET`  | `/resources/{id}/events` | that resource's audit trail |
 | `GET`  | `/events` | the global append-only log |
 | `GET`  | `/stats` | substrate counters |
+| `GET`  | `/search` | ranked retrieval over what the shelf holds (`?q=`, `?k=`) |
+| `GET`  | `/search/health` | is the index in step with the shelf, and was it built by the model it claims |
+| `POST` | `/discover` | go upstream to the public MCP registry when the shelf has nothing (registers finds as `draft`) |
+| `GET`  | `/resources/{id}/trust` | what the ledger earns a resource, and which precondition is failing |
+| `POST` | `/mcp` | **the MCP front door** — JSON-RPC 2.0: `tools/list` (paged), `tools/lookup`, `tools/call` |
+
+### The MCP door
+
+`/mcp` is the same shelf, spoken in the protocol other agents already speak, so
+Claude Desktop / Cursor / any MCP client can list and call what is here. It is a
+translation and not a second implementation: a call reaches
+`ResourceRegistry.invoke`, so the trust policy, the ledger write and the audit
+event all still happen. Two things are worth knowing:
+
+* `tools/list` **pages** (100 per page, `?cursor` to continue). Measured on
+  2026-09-28, the shelf's 9,533 tools in one reply is 5.4 MB — a reply no client
+  can use. Paging is ordered by id and the cursor is the next id, not an offset,
+  so it cannot skip a row that was added between two calls.
+* `tools/lookup` is a non-standard extension, and named as one: a query scored
+  against name/description/tags over the *live* registry. It exists because the
+  search index is built at process start, and on a shelf with more than one
+  writer a freshly imported tool is missing from `/search` while being plainly
+  present here.
+
+Reads also refresh: the registry re-reads the store when another process has
+written to it (one indexed aggregate when nothing has), because the importer and
+the serving process share one database and a snapshot taken at boot answered
+`404` for rows that existed on disk.
 
 ## Deployment
 

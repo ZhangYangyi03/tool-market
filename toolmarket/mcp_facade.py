@@ -127,6 +127,170 @@ def _tool_text(content: Any) -> list[dict[str, Any]]:
              "text": json.dumps(content, ensure_ascii=False, default=str)}]
 
 
+# -- paging, and the door that does not depend on an index ------------------
+#
+# Measured on this shelf 2026-09-28, with 9,533 tools on it: `tools/list` with
+# every schema in one reply is 5,365,686 bytes. That number is not a slow reply,
+# it is an unusable one -- no client puts 9,533 tool schemas in front of a
+# model, and the same shelf seen from the *other* side (autoforge's own prompt
+# budget, 6,000 characters for the whole library) says why: a shelf of ten
+# thousand tools cannot be an inventory a model holds, only one it queries.
+#
+# So `tools/list` pages, ordered by id, with an opaque cursor. Absent arguments
+# mean the first page, because the MCP default every client already assumes is
+# "list what you have"; an over-large `limit` is clamped rather than refused,
+# since a client asking for 10,000 has told us what it wants, not made a mistake.
+#
+# `tools/lookup` is the second half and the more important one. A client that
+# cannot enumerate a shelf still has to be able to ask it a question, and the
+# shelf's own `/search` cannot answer for a name: measured today, a full-text
+# query for the exact id of a tool imported an hour earlier returned ten
+# unrelated tools, because the index was built at process start. A lookup that
+# runs against the live registry cannot go stale -- there is nothing to rebuild.
+# It scores on the same three fields a person would check (name, description,
+# tags) by the share of query terms present, which is the honest amount of
+# sophistication for a fallback: it cannot be wrong about what it holds, only
+# about what it ranks.
+DEFAULT_PAGE = 100
+MAX_PAGE = 500
+#: How many records a lookup scans before it must stop being called cheap.
+LOOKUP_POOL = 20000
+
+
+def _tools(reg: Any) -> list[Any]:
+    """Every tool resource, in a stable order.
+
+    Refreshes first, when the registry offers it, because this deployment has
+    two writers: `mcp_import` writes the store while the API serves. Without
+    this the facade answers from the snapshot taken at process start, which on
+    2026-09-28 meant `tools/list` reported 6,985 tools for a shelf of 11,871 and
+    `tools/call` for a freshly imported one came back "unknown tool" about
+    something plainly present. Free when nothing changed: one indexed aggregate.
+    """
+    ref = getattr(reg, "refresh", None)
+    if callable(ref):
+        try:
+            ref(max_age=1.0)
+        except Exception:  # noqa: BLE001 - a read must not fail on a refresh
+            pass
+    return sorted(reg.list(type="tool"), key=lambda r: r.id)
+
+
+def _page(records: list[Any], params: dict[str, Any]) -> dict[str, Any]:
+    """One page of `tools/list`, plus `nextCursor` when there is more.
+
+    The MCP spec's cursor is *opaque*: a client must not parse it, and this one
+    is the id of the next record rather than an offset on purpose. An offset
+    into a list that can change between calls skips or repeats rows when the
+    shelf grows; an id-bound cursor resumes at the same place whatever happened
+    to the rows before it.
+    """
+    limit = params.get("limit")
+    try:
+        limit = int(limit) if limit is not None else DEFAULT_PAGE
+    except (TypeError, ValueError):
+        limit = DEFAULT_PAGE
+    limit = max(1, min(limit, MAX_PAGE))
+    cursor = params.get("cursor")
+    start = 0
+    if isinstance(cursor, str) and cursor:
+        # Linear in a list already in memory, which is the whole store: the
+        # alternative (bisect on a sorted key) buys microseconds on a scan that
+        # happens once per page, and would have to re-sort beneath a live edit.
+        start = next((i for i, r in enumerate(records) if r.id == cursor),
+                     len(records))
+    window = records[start:start + limit]
+    out: dict[str, Any] = {"tools": [tool_view(r) for r in window]}
+    if start + len(window) < len(records) and window:
+        out["nextCursor"] = records[start + len(window)].id
+    return out
+
+
+_SPLIT = None
+
+
+def _terms(text: str) -> list[str]:
+    """Query terms, token-shaped: alphanumeric runs of two or more characters."""
+    import re as _re
+    global _SPLIT
+    if _SPLIT is None:
+        _SPLIT = _re.compile(r"[^0-9A-Za-z]+")
+    return [w for w in _SPLIT.split((text or "").lower()) if len(w) > 1]
+
+
+def _tokens(text: str) -> set[str]:
+    """The same split applied to a record's text, as a set for membership."""
+    return {w for w in _terms(text) if w}
+
+
+def _matches(term: str, tokens: set[str]) -> bool:
+    """Is `term` a thing this field says?
+
+    Equal to a token, or a prefix of one, and nothing else. Substring matching
+    was tried and is wrong in a way that is easy to see once you look: on the
+    live shelf, `unknown tool: nope` came back offering
+    `mcp_com_snopekgames_godai`, because "nope" sits inside "snopekgames". A
+    near-miss list that is a coincidence is worse than no near-miss list -- it
+    is noise wearing the costume of help.
+
+    A prefix, but only from three characters up: "resume" finding
+    `run_resume_report` is the case this is for, and a two-letter prefix would
+    match a tenth of a shelf this size.
+    """
+    if term in tokens:
+        return True
+    return len(term) >= 3 and any(t.startswith(term) for t in tokens)
+
+
+#: A term found in the *name* is worth this much against one found only in the
+#: prose. Measured on the live shelf: an unweighted substring match let two
+#: `mcp_guru_*`/`mcp_io_*` rows tie with `run_resume_report` for the query
+#: "resume_run", because "resume" and "run" both appear somewhere in a long
+#: generated description. A name is the field a caller actually typed.
+_NAME_WEIGHT = 1.0
+_DOC_WEIGHT = 0.6
+
+
+def _fields(rec: Any) -> tuple[set[str], set[str]]:
+    """(name tokens, descriptor tokens) — the two fields a lookup scores against."""
+    tags = (getattr(rec, "metadata", None) or {}).get("tags") or []
+    return (_tokens(rec.name or ""),
+            _tokens(" ".join([rec.description or ""] + [str(t) for t in tags])))
+
+
+def lookup(reg: Any, query: str, limit: int = 10) -> list[tuple[Any, float]]:
+    """Tools whose name/description/tags contain the query's terms.
+
+    Share of terms present, weighted by which field matched: a two-term query
+    where one term matches scores 0.5 and sorts below one where both do, and a
+    term found in the tool's *name* counts for more than one found only in its
+    description. Not a cosine and not a learned rank -- this is a fallback, and
+    it is honest about being one. Ties break on id, so the same query answers the
+    same way twice: a lookup whose order wobbles between calls cannot be tested
+    and is unpleasant to use.
+
+    A record with *no* matching term is dropped rather than returned at score 0.
+    Returning the near-misses would make "nothing on the shelf" impossible to
+    say, and that sentence is the one that tells a caller to go upstream.
+    """
+    terms = _terms(query)
+    if not terms:
+        return []
+    scored: list[tuple[Any, float]] = []
+    for rec in reg.list(type="tool"):
+        name, descriptors = _fields(rec)
+        weight = 0.0
+        for t in terms:
+            if _matches(t, name):
+                weight += _NAME_WEIGHT
+            elif _matches(t, descriptors):
+                weight += _DOC_WEIGHT
+        if weight:
+            scored.append((rec, weight / len(terms)))
+    scored.sort(key=lambda pair: (-pair[1], pair[0].id))
+    return scored[:max(1, min(int(limit or 10), MAX_PAGE))]
+
+
 # -- request handling ------------------------------------------------------
 def handle(reg: Any, msg: dict[str, Any]) -> Optional[dict[str, Any]]:
     """One JSON-RPC message in, one response out. None for a notification.
@@ -168,14 +332,37 @@ def handle(reg: Any, msg: dict[str, Any]) -> Optional[dict[str, Any]]:
     if method == "ping":
         return _rpc_result(msg_id, {})
     if method == "tools/list":
-        tools = [tool_view(r) for r in reg.list(type="tool")]
-        return _rpc_result(msg_id, {"tools": tools})
+        return _rpc_result(msg_id, _page(_tools(reg), params))
+    if method == "tools/lookup":
+        return _rpc_result(msg_id, _lookup_view(reg, params))
     if method == "tools/call":
         return _call(reg, msg_id, params)
     if is_notification:
         return None
     return _rpc_error(msg_id, JSONRPC_METHOD_NOT_FOUND,
                       f"unknown method: {method}")
+
+
+def _lookup_view(reg: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """`tools/lookup` — search the shelf by name, without an index to go stale.
+
+    A non-standard method: MCP defines `tools/list` and `tools/call` and nothing
+    in between, so this is an extension and is named as one. The alternative was
+    to make `tools/list` take a `query` argument, which would be a silent change
+    to a standard method's meaning -- a client that sent `query` to a spec-
+    compliant server and got everything back could not tell the difference.
+
+    It answers in `tools/list`'s shape (the same objects, the same keys) so a
+    client needs one renderer for both, plus its own `score` per entry.
+    """
+    query = params.get("query") or params.get("q") or ""
+    if not isinstance(query, str) or not query.strip():
+        return {"tools": [], "query": "", "error": "query is required"}
+    limit = params.get("limit") or 10
+    hits = lookup(reg, query, limit)
+    return {"query": query, "count": len(hits),
+            "tools": [{**tool_view(rec), "score": round(score, 4)}
+                      for rec, score in hits]}
 
 
 def _call(reg: Any, msg_id: Any, params: dict[str, Any]) -> dict[str, Any]:
@@ -187,6 +374,16 @@ def _call(reg: Any, msg_id: Any, params: dict[str, Any]) -> dict[str, Any]:
         return _rpc_error(msg_id, JSONRPC_INVALID_PARAMS,
                           "arguments must be an object")
 
+    # Refresh before resolving: a tool registered by another process since this
+    # one started is a tool this door must be able to call. Cheap when nothing
+    # changed (one indexed aggregate) and the whole point when something has.
+    ref = getattr(reg, "refresh", None)
+    if callable(ref):
+        try:
+            ref(max_age=1.0)
+        except Exception:  # noqa: BLE001
+            pass
+
     rid = f"tool:{name}"
     if reg.get(rid) is None:
         # Fall back to the display name: a resource registered under a
@@ -194,8 +391,14 @@ def _call(reg: Any, msg_id: Any, params: dict[str, Any]) -> dict[str, Any]:
         # worst of the two failure modes because tools/list said it existed.
         match = next((r for r in reg.list(type="tool") if r.name == name), None)
         if match is None:
-            return _rpc_error(msg_id, JSONRPC_INVALID_PARAMS,
-                              f"unknown tool: {name}")
+            # Last resort, and only for a *name* the shelf may hold under a
+            # prefixed id. Say what was tried rather than a bare "unknown":
+            # `lookup` can answer "did you mean", and a client that gets a
+            # near-miss is one step from the right call instead of stuck.
+            near = [r.name for r, _ in lookup(reg, name, 3)]
+            return _rpc_error(
+                msg_id, JSONRPC_INVALID_PARAMS, f"unknown tool: {name}",
+                data={"near_misses": near} if near else None)
         rid = match.id
 
     # An unknown tool is a protocol error (above) and a failed run is not: the

@@ -253,6 +253,43 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
         lambda: [_record_view(r) for r in reg.list()])
 
 
+    # -- staying current when the shelf has more than one writer ------------
+    #
+    # The registry is built once, here, and held for the process's life; `save`
+    # keeps it in step with *this* process's writes and with nothing else's. On
+    # this machine the shelf has two writers -- `mcp_import` writes the sqlite
+    # file directly, the API serves :8000 -- and the failure that produced is
+    # measurable: the importer had written 11,871 resources while `/health` said
+    # 6,985 and `/resources/tool:<id>` answered 404 for a row that existed on
+    # disk, three minutes old.
+    #
+    # So reads refresh first, against a high-water mark that costs one indexed
+    # aggregate when there is nothing new. This is deliberately *not* a cache
+    # invalidation protocol: there is one store and it is the source of truth,
+    # and the question "did anything change" is answerable by asking it.
+    #
+    # Index sync rides along, because the search index has the same staleness and
+    # a worse symptom -- `/search` for a recently imported tool's exact id
+    # returned ten unrelated tools, since the index was built at startup. Only
+    # the changed rows are indexed, so this is O(new) and not O(shelf).
+    _FRESH = float(os.environ.get("READ_FRESH_S", "1.0") or 0)
+
+    def _refresh() -> list[Any]:
+        try:
+            changed = reg.refresh(max_age=_FRESH)
+        except Exception:  # noqa: BLE001 - a read must not fail on a refresh
+            return []
+        if changed:
+            try:
+                for rec in changed:
+                    app.state.search.index_text(
+                        "tools", rec.id,
+                        _vs.build_resource_text(_record_view(rec)),
+                        {"name": rec.name, "state": rec.state.value})
+            except Exception:  # noqa: BLE001 - retrieval degrades, reads do not
+                pass
+        return changed
+
     def _op(reg_: ResourceRegistry):
         from toolmarket.protocol.sepl import EvolutionOperator
         return EvolutionOperator(reg_)
@@ -364,6 +401,7 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
         No store call, no cache call — see the module docstring. A probe that
         fails when a dependency is down gets you a restart loop, not a diagnosis.
         """
+        _refresh()
         return {"ok": True, "resources": len(reg.list()),
                 "events": len(reg.log), "chain_ok": reg.log.verify_chain()}
 
@@ -436,11 +474,13 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
     @app.get("/resources")
     def list_resources(type: Optional[str] = None,
                        state: Optional[str] = None) -> dict[str, Any]:
+        _refresh()
         rows = reg.list(type=type, state=state)
         return {"count": len(rows), "resources": [_record_view(r) for r in rows]}
 
     @app.get("/search")
     def search(q: str = "", k: int = 10) -> dict[str, Any]:
+        _refresh()
         k = max(1, min(int(k), 50))
         if not q.strip():
             return {"query": q, "mode": "bm25", "count": 0, "results": []}
@@ -631,6 +671,7 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
         changes the moment somebody registers the tool, and caching it means the
         registry's own `register` response is contradicted by a stale miss.
         """
+        _refresh()
         cache = get_cache()
         key = resource_key(resource_id)
         ttl = app.state.cache_ttl

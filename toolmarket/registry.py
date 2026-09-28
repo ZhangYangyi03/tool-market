@@ -85,6 +85,14 @@ class ResourceRegistry:
         self._records: dict[str, ResourceRecord] = {
             r.id: r for r in self.store.load_resources()
         }
+        # The high-water mark of what is already loaded, so `refresh` can tell
+        # "nothing new" from "not checked yet" without re-reading the table. Set
+        # from the records themselves rather than from `max_updated_at()`: a
+        # store that cannot answer that query still gets a correct baseline.
+        self._loaded_stamp = max(
+            (getattr(r, "updated_at", 0.0) for r in self._records.values()),
+            default=0.0)
+        self._refreshed_at = 0.0
         self._baselines: dict[str, Any] = {}
         # Set by `make_queue` on first request, so every surface built over this
         # registry shares one inline queue. None means "no queue asked for yet".
@@ -124,6 +132,59 @@ class ResourceRegistry:
         if state is not None:
             out = [r for r in out if r.state.value == state]
         return sorted(out, key=lambda r: r.id)
+
+    def refresh(self, *, max_age: float = 0.0) -> list[Any]:
+        """Re-read the store, so a row another process wrote becomes visible.
+
+        The registry is a *cache* of the store: `__init__` fills `_records`
+        once, and `save` keeps it in step with this process's own writes. That
+        is correct for one writer and silently wrong for two, which is what this
+        deployment is -- the importer holds the sqlite file while the API serves
+        :8000, and the API's copy is whatever existed when it booted.
+
+        Measured 2026-09-28: the importer had written to 11,871 resources while
+        `/health` on the live shelf said 6,985 and `/resources/tool:<id>` for a
+        row written minutes earlier answered 404. Nothing was broken and nothing
+        was stale about the *store*; the process was answering faithfully from a
+        snapshot it had no reason to know was one.
+
+        What it deliberately does not do: evict. A resource deleted underneath
+        this process stays in `_records` until a restart, because dropping a
+        record another request may be mid-way through using is a worse failure
+        than listing one row too many. New and changed rows are the case that
+        matters -- that is the case where a caller is told "no such tool" about a
+        tool that plainly exists.
+
+        Zero-cost when the store has nothing new: the `updated_at` high-water
+        mark is one indexed query, and a second call within `max_age` seconds
+        does not even do that.
+
+        Returns the records that were new or changed -- not a count. The caller
+        is usually a search index that has to be told *which* rows to index, and
+        making it diff the registry itself to find out would be the same walk
+        done twice.
+        """
+        now = time.time()
+        if max_age and (now - getattr(self, "_refreshed_at", 0.0)) < max_age:
+            return []
+        self._refreshed_at = now
+        try:
+            stamp = self.store.max_updated_at()
+        except Exception:  # noqa: BLE001 - an unsupported store is not a failure
+            stamp = None
+        if stamp is not None and stamp <= getattr(self, "_loaded_stamp", 0.0):
+            return []
+        loaded = self.store.load_resources()
+        changed: list[ResourceRecord] = []
+        for rec in loaded:
+            old = self._records.get(rec.id)
+            if old is None or getattr(old, "updated_at", 0) != rec.updated_at:
+                self._records[rec.id] = rec
+                self._invalidate(rec.id)
+                changed.append(rec)
+        self._loaded_stamp = max([stamp or 0.0] +
+                                 [getattr(r, "updated_at", 0.0) for r in loaded])
+        return changed
 
     # -- write ------------------------------------------------------------
     def save(self, rec: ResourceRecord) -> None:

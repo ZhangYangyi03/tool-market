@@ -234,6 +234,19 @@ class PostgresStore:
             row = cur.fetchone()
         return ResourceRecord.from_dict(_as_dict(row[0])) if row else None
 
+    def max_updated_at(self) -> float:
+        """Newest `updated_at` held here; 0.0 when empty. See `ResourceStore`.
+
+        Present so `ResourceRegistry.refresh` has one call to make against either
+        backend -- a store that cannot answer this would be a store the registry
+        had to know the type of, which is the coupling the store layer exists to
+        prevent.
+        """
+        with self._cursor() as cur:
+            cur.execute("SELECT MAX(updated_at) FROM resources")
+            row = cur.fetchone()
+        return float(row[0]) if row and row[0] is not None else 0.0
+
     def load_resources(self) -> list[ResourceRecord]:
         with self._cursor() as cur:
             cur.execute("SELECT json FROM resources ORDER BY updated_at")
