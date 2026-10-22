@@ -520,19 +520,35 @@ class Store:
                     rid = r.get("id") or r.get("name")
                     if rid:
                         by_id[rid] = hash_text(build_resource_text(r))
-                stale = not_on_shelf = 0
+                stale = not_on_shelf = missing = 0
+                indexed = set()
                 for rid, chash in self.conn.execute(
                         "SELECT resource_id, content_hash FROM lexical WHERE collection=?", (name,)):
+                    indexed.add(rid)
                     cur = by_id.get(rid)
                     if cur is None:
                         not_on_shelf += 1
                     elif chash != cur:
                         stale += 1
+                # The other direction, and the one that actually happened: a
+                # shelf of 16,910 resources with 4 rows in the index passes every
+                # check above, because the only rows it looks at are the ones
+                # that are there. Measured 2026-10-22 -- /search returned 0 for
+                # every query for three weeks while /search/health said
+                # {"ok": true, "problems": []}, because "88% of the index is fine"
+                # and "0.02% of the shelf is indexed" are different sentences.
+                missing = sum(1 for rid in by_id if rid not in indexed)
+                info["resources_not_indexed"] = missing
                 info["resources_not_on_shelf"] = not_on_shelf
                 info["stale_documents"] = stale
                 if stale:
                     problems.append("%s: %d documents changed since indexing; sync is behind"
                                     % (name, stale))
+                if missing:
+                    problems.append(
+                        "%s: %d of %d shelf resources are not in the index at all;"
+                        " retrieval cannot see them"
+                        % (name, missing, len(by_id)))
                 if not_on_shelf:
                     warnings.append("%s: %d indexed resources are no longer on the shelf"
                                     % (name, not_on_shelf))

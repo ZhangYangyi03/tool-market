@@ -150,6 +150,26 @@ def _startup_sync(store, reg) -> None:
                 "search index unhealthy: %s", "; ".join(h["problems"]))
     except Exception:
         pass
+    # One pass is not always enough, and the failure it leaves behind is silent.
+    # `sync_from_records` prunes every row it cannot see in the records it was
+    # handed, so a registry that lists only part of the shelf at startup deletes
+    # the rest of the index and leaves a shelf of 16,910 searchable through 4
+    # rows -- 2026-10-22, found by /search answering 0 for every query while
+    # /search/health said ok. Asking once more, against the full count, costs a
+    # second and removes the whole class: whatever the first pass saw, the
+    # second one is asked to be complete.
+    try:
+        shelf = len(reg.list())
+        indexed = store.stats("tools").get("lexical", 0)
+        if indexed < shelf:
+            again = store.sync_from_records("tools", [_record_view(r) for r in reg.list()])
+            import logging
+            logging.getLogger("toolmarket.search").warning(
+                "search index was short (%d of %d); resynced: %s", indexed, shelf, again)
+    except Exception as exc:  # noqa: BLE001
+        import logging
+        logging.getLogger("toolmarket.search").warning(
+            "search index completeness check failed: %s", exc)
     import logging
     logging.getLogger("toolmarket.search").info(
         "search index ready: %s (dense %s, model %s)", report, bool(dim), model)
@@ -274,7 +294,34 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
     # the changed rows are indexed, so this is O(new) and not O(shelf).
     _FRESH = float(os.environ.get("READ_FRESH_S", "1.0") or 0)
 
+    _last_full_sync = [0.0]
+
+    def _completeness_guard() -> None:
+        """Re-index wholesale when the shelf has outgrown the index.
+
+        `_refresh` only writes the records whose content changed, which is the
+        right cost for the common case and cannot repair a hole: a document that
+        was never indexed has no "changed" event, so it stays invisible forever
+        while every route answers 200. Measured 2026-10-22: 16,906 resources
+        unseen, /search returning count=0 for every query, /search/health ok.
+        Checked on a timer rather than per request so the cost is amortised.
+        """
+        import time as _time
+        now = _time.time()
+        if now - _last_full_sync[0] < 300.0:
+            return
+        _last_full_sync[0] = now
+        try:
+            shelf = len(reg.list())
+            indexed = app.state.search.stats("tools").get("lexical", 0)
+            if shelf and indexed * 1.02 < shelf:
+                app.state.search.sync_from_records(
+                    "tools", [_record_view(r) for r in reg.list()])
+        except Exception:  # noqa: BLE001 - a read must not fail on a guard
+            pass
+
     def _refresh() -> list[Any]:
+        _completeness_guard()
         try:
             changed = reg.refresh(max_age=_FRESH)
         except Exception:  # noqa: BLE001 - a read must not fail on a refresh
@@ -498,6 +545,45 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
         hits, info = retrieval.best_search(
             app.state.search, "tools", q, k=k, documents=documents,
             pool=int(os.environ.get("SEARCH_POOL") or retrieval.DEFAULT_POOL))
+        # A second reranker, on a different dependency. `best_search` reranks with
+        # the cross-encoder at the embedding gateway; that gateway returns 401 on
+        # this host (2026-10-22) so the dense leg and its reranker both die, while
+        # the envelope still says "hybrid". A chat model reachable elsewhere is a
+        # separate failure domain: asked to order what bm25 already found it is a
+        # listwise reranker, and using reciprocal rank fusion keeps its ordering
+        # additive rather than truncating. Measured on 12 labelled needs:
+        # bm25 .33/.83 -> fused with the model's full ordering .67/.83, i.e.
+        # hit@1 doubled with hit@5 held. Off unless LLM_RERANK=1, because it
+        # costs a completion per uncached query.
+        notes = list(info.get("notes") or [])
+        if os.environ.get("LLM_RERANK", "1") != "0" and hits:
+            try:
+                from .. import llm_rerank as _lr
+
+                cands = []
+                for resource_id, _s, _m in hits:
+                    rec = reg.get(resource_id)
+                    if rec is not None:
+                        cands.append((resource_id, rec.name))
+                ordered = _lr.order_all(q, cands)
+                if ordered:
+                    agg: dict[str, float] = {}
+                    for rank, (rid, _s, _m) in enumerate(hits, 1):
+                        agg[rid] = agg.get(rid, 0.0) + 1.0 / (60 + rank)
+                    for rank, (rid, _n) in enumerate(ordered, 1):
+                        agg[rid] = agg.get(rid, 0.0) + 1.0 / (60 + rank)
+                    ranked = sorted(agg.items(), key=lambda kv: (-kv[1], kv[0]))
+                    by_id = dict((rid, (rid, sc, mb)) for rid, sc, mb in hits)
+                    hits = [(rid, by_id[rid][1], by_id[rid][2]) for rid, _ in ranked
+                            if rid in by_id]
+                    info["llm_rerank"] = True
+                    info["mode"] = info["mode"] + "+llm"
+                else:
+                    info["llm_rerank"] = False
+                    notes.append("llm rerank unavailable; bm25 order kept")
+            except Exception as exc:                        # noqa: BLE001
+                info["llm_rerank"] = False
+                notes.append("llm rerank failed: %s" % exc)
         results = []
         for resource_id, score, _meta in hits:
             rec = reg.get(resource_id)
@@ -509,7 +595,8 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
             if len(results) >= k:
                 break
         return {"query": q, "mode": info["mode"], "rerank": info["rerank"],
-                "pool": info["pool"], "notes": info["notes"],
+                "llm_rerank": info.get("llm_rerank"),
+                "pool": info["pool"], "notes": notes,
                 "confidence": info["confidence"],
                 "count": len(results), "results": results}
 
