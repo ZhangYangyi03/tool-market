@@ -25,7 +25,23 @@ import time
 import urllib.error
 import urllib.request
 
-DEFAULT_CONFIG = "C:/Users/china/.autoforge/config.json"
+def _default_config_path() -> str:
+    """The autoforge config that may carry the key, resolved for this machine.
+
+    The value used to be a hard-coded Windows path
+    (``C:/Users/china/.autoforge/config.json``). On any other platform that file
+    does not exist, so `_read_config_key` returned "" and the dense leg was
+    skipped -- a silent, platform-shaped failure whose only visible symptom was
+    "retrieval feels worse here". Resolve the real home directory; `EMBED_CONFIG`
+    still overrides it explicitly.
+    """
+    env = os.environ.get("EMBED_CONFIG")
+    if env:
+        return env
+    return os.path.join(os.path.expanduser("~"), ".autoforge", "config.json")
+
+
+DEFAULT_CONFIG = _default_config_path()
 
 
 class EmbedUnavailable(RuntimeError):
@@ -45,8 +61,15 @@ def _read_config_key(path):
 
 def settings():
     base = (os.environ.get("EMBED_BASE_URL") or "https://aiping.cn/api/v1").rstrip("/")
+    # Precedence: an embedding-specific key, then the file it names, then the
+    # chat-gateway key this deployment already carries (AIPING_/OPENAI_), then
+    # the autoforge config on disk. The gateway keys are a real fallback rather
+    # than a guess: the same AI Ping key serves /chat/completions, /rerank and
+    # /embeddings, so one key can drive the whole retrieval stack.
     key = os.environ.get("EMBED_API_KEY") or _read_config_key(
         os.environ.get("EMBED_CONFIG") or DEFAULT_CONFIG)
+    if not key:
+        key = os.environ.get("AIPING_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
     try:
         dim = int(os.environ.get("EMBED_DIM") or "1024")
     except Exception:

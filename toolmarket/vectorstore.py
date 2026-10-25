@@ -328,6 +328,46 @@ class Store:
         scored.sort(key=lambda x: (-x[1], x[0]))
         return scored[:k]
 
+    def lexical_hashes(self, collection):
+        """resource_id -> content_hash for the documents the lexical leg holds.
+
+        A vector has to carry the hash of the document it stands in for, and that
+        hash belongs to the lexical row, not to whatever text a backfiller
+        happened to embed. Deriving it independently makes "stale vector"
+        detectable only when both sides are computed the same way -- so take it
+        from the row itself and the comparison is exact by construction.
+        """
+        return dict(self.conn.execute(
+            "SELECT resource_id, content_hash FROM lexical WHERE collection=?",
+            (collection,)).fetchall())
+
+    def needs_vector(self, collection, resource_id, chash):
+        """True when this document has no vector for this exact text."""
+        row = self.conn.execute(
+            "SELECT content_hash FROM vectors WHERE resource_id=? AND collection=?",
+            (resource_id, collection),
+        ).fetchone()
+        return row is None or row[0] != chash
+
+    def missing_vectors(self, collection):
+        """Ids the dense leg cannot see: indexed lexically, but no vector.
+
+        `health()` counts these as a warning ("lexical rows have no vector"), and
+        that warning was true for every document on every deployment, because
+        nothing ever wrote a vector: `index_vector` had no caller. A backfill
+        needs the exact complement of what is stored, at content-hash
+        granularity, so a document is re-embedded when its text changed and not
+        when it did not. A LEFT JOIN cannot express "vector exists but is stale",
+        hence the extra predicate.
+        """
+        return [r[0] for r in self.conn.execute(
+            "SELECT l.resource_id FROM lexical l"
+            " LEFT JOIN vectors v ON v.resource_id = l.resource_id"
+            "                    AND v.collection = l.collection"
+            " WHERE l.collection = ?"
+            "   AND (v.resource_id IS NULL OR v.content_hash IS NOT l.content_hash)"
+            " ORDER BY l.resource_id", (collection,))]
+
     def index_vector(self, collection, resource_id, vector, meta=None, chash=None, model_id=None):
         vec = [float(x) for x in vector]
         dim = len(vec)
