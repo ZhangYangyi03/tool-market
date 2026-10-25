@@ -82,6 +82,109 @@ def weight_search(store, collection, query, vector, k=DEFAULT_POOL, alpha=DEFAUL
     return rows[:k]
 
 
+def backfill_vectors(store, collection, records=None, documents=None, limit=None):
+    """Give the dense leg something to read.
+
+    Measured 2026-10-25 on a live shelf: `/search/health` said "10 lexical rows
+    have no vector" and /search reported ``mode: hybrid`` -- because the embedder
+    answered -- while the collection held zero vectors, so `weight_search` fell
+    through to the lexical leg alone and the ranking was bm25's. The hybrid
+    label was not wrong about intent and was wrong about fact.
+
+    The cause was not a threshold or a flag: `Store.index_vector` had no caller
+    anywhere in the tree. Nothing ever embedded a document, so the dense leg
+    could only ever be empty, and hit@5 could only ever be bm25's 0.893 no
+    matter what EMBED_* was set to.
+
+    This embeds exactly the documents the store says it is missing, at
+    content-hash granularity (see `Store.missing_vectors`), and writes them with
+    the model id that produced them. Nothing is embedded twice for the same
+    text; nothing is left un-embedded for a text that changed.
+
+    Returns a report rather than raising: a shelf without an embedder is a
+    supported state -- it is just a lexically-retrieved one, and `info["mode"]`
+    already says so.
+    """
+    report = {"collection": collection, "candidates": 0, "embedded": 0,
+              "failed": 0, "remaining": 0, "model": None, "error": None,
+              "note": None}
+    # The text that gets embedded has to be the text that was indexed, or the two
+    # legs describe different documents. The lexical row keeps term frequencies,
+    # not prose, so the caller supplies it: `records` (the same dicts the index
+    # was built from -- exact by construction) or `documents` (id -> text).
+    by_id = {}
+    for rec in (records or []):
+        rid = rec.get("id") or rec.get("name")
+        if rid:
+            by_id[rid] = _vs.build_resource_text(rec)
+    for rid, text in (documents or {}).items():
+        by_id[rid] = text
+    try:
+        col = None
+        for c in store.list_collections():
+            if c["name"] == collection:
+                col = c
+                break
+        s = _embed.settings()
+        if not s.get("api_key"):
+            report["error"] = "no embedding api key; dense leg stays empty"
+            return report
+        if col is None or not col["dim"]:
+            report["error"] = ("collection has no vector space (dim unset); "
+                               "recreate it with a dim before backfilling")
+            return report
+        if col["model_id"] not in (None, s["model"]):
+            report["error"] = ("collection holds %r vectors, embedder is %r; "
+                               "refusing to mix models" % (col["model_id"], s["model"]))
+            return report
+        report["model"] = s["model"]
+        missing = store.missing_vectors(collection)
+        if limit is not None:
+            missing = missing[:int(limit)]
+        report["candidates"] = len(missing)
+        if not missing:
+            return report
+        # The text that is embedded has to be the text that was indexed, or the
+        # two legs describe different documents. `documents` lets a caller hand
+        # over the registry's own prose (it is the same string the lexical leg
+        # was built from); otherwise the stored metadata is used, and a document
+        # whose text cannot be recovered is skipped and counted, not guessed.
+        texts, ids, unknown = [], [], []
+        for rid in missing:
+            text = by_id.get(rid)
+            if not text:
+                unknown.append(rid)
+                continue
+            ids.append(rid)
+            texts.append(text)
+        if unknown:
+            # Named, not silently skipped: an id with no recoverable text is a
+            # document the dense leg will keep missing, and a count of 0 embedded
+            # with no reason is how the empty vector space stayed invisible.
+            report["failed"] = len(unknown)
+            report["note"] = ("no text for %d document(s): %s"
+                              % (len(unknown), ", ".join(unknown[:5])))
+        if not texts:
+            report["remaining"] = len(store.missing_vectors(collection))
+            return report
+        hashes = store.lexical_hashes(collection)
+        vectors = _embed.embed_texts(texts, s=s)
+        for rid, vec in zip(ids, vectors):
+            try:
+                store.index_vector(collection, rid, vec,
+                                   meta={"name": rid.split(":", 1)[-1]},
+                                   chash=hashes.get(rid), model_id=s["model"])
+                report["embedded"] += 1
+            except Exception:                                      # noqa: BLE001
+                report["failed"] += 1
+        report["remaining"] = len(store.missing_vectors(collection))
+    except _embed.EmbedUnavailable as exc:
+        report["error"] = "embed unavailable: %s" % exc
+    except Exception as exc:                                       # noqa: BLE001
+        report["error"] = "%s: %s" % (type(exc).__name__, exc)
+    return report
+
+
 def best_search(store, collection, query, k=5, pool=DEFAULT_POOL, alpha=DEFAULT_ALPHA,
                 use_rerank=True, rerank_model=None, documents=None):
     """Retrieve, then rerank the top of the list with a cross-encoder.

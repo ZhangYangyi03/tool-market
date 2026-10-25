@@ -108,8 +108,16 @@ def _record_view(rec: ResourceRecord) -> dict[str, Any]:
 
 
 def _data_dir() -> str:
-    """Where toolmarket keeps its data, independent of the process cwd."""
-    return os.environ.get("TOOLMARKET_DATA_DIR") or r"C:\Users\china"
+    """Where toolmarket keeps its data, independent of the process cwd.
+
+    The fallback used to be a hard-coded Windows path (``C:\\Users\\china``).
+    On Linux/macOS that directory does not exist, so the index landed wherever
+    the process happened to be able to write -- and a checkout on such a machine
+    grew a literal ``C:\\Users\\china`` directory next to the source, which is
+    how the default was found to be wrong. Resolve the real home directory and
+    let ``TOOLMARKET_DATA_DIR`` override it, as before.
+    """
+    return os.environ.get("TOOLMARKET_DATA_DIR") or os.path.expanduser("~")
 
 
 def _startup_sync(store, reg) -> None:
@@ -170,6 +178,23 @@ def _startup_sync(store, reg) -> None:
         import logging
         logging.getLogger("toolmarket.search").warning(
             "search index completeness check failed: %s", exc)
+    # Then fill the vectors. Declaring a dimension makes a vector space
+    # *possible*; it does not put anything in it, and nothing in this tree ever
+    # did -- `index_vector` had no caller, so every deployment reported
+    # `mode: hybrid` while ranking on bm25 alone. Measured 2026-10-25: 10 lexical
+    # rows, 0 vectors, /search/health carrying the warning and nobody reading it.
+    if dim:
+        try:
+            bf = retrieval.backfill_vectors(
+                store, "tools", records=[_record_view(r) for r in reg.list()])
+        except Exception as exc:  # noqa: BLE001
+            # Assigned to `bf`, not to a lookalike name: the report is read on the
+            # next line, and a NameError here takes down startup over a leg that
+            # is allowed to be absent. A failed backfill is a report, not a crash.
+            bf = {"embedded": 0, "error": "%s: %s" % (type(exc).__name__, exc)}
+        if bf.get("embedded") or bf.get("error") or bf.get("note"):
+            import logging
+            logging.getLogger("toolmarket.search").info("dense backfill: %s", bf)
     import logging
     logging.getLogger("toolmarket.search").info(
         "search index ready: %s (dense %s, model %s)", report, bool(dim), model)
@@ -328,11 +353,18 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
             return []
         if changed:
             try:
+                docs = {}
                 for rec in changed:
+                    text = _vs.build_resource_text(_record_view(rec))
                     app.state.search.index_text(
-                        "tools", rec.id,
-                        _vs.build_resource_text(_record_view(rec)),
+                        "tools", rec.id, text,
                         {"name": rec.name, "state": rec.state.value})
+                    docs[rec.id] = text
+                # A changed document has a new content hash, so its old vector is
+                # stale -- `missing_vectors` reports it and this fills it. Without
+                # this step a tool edited after startup keeps a vector describing
+                # its previous text, and the dense leg ranks on the old meaning.
+                retrieval.backfill_vectors(app.state.search, "tools", documents=docs)
             except Exception:  # noqa: BLE001 - retrieval degrades, reads do not
                 pass
         return changed
@@ -545,6 +577,16 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
         hits, info = retrieval.best_search(
             app.state.search, "tools", q, k=k, documents=documents,
             pool=int(os.environ.get("SEARCH_POOL") or retrieval.DEFAULT_POOL))
+        # Say which legs actually produced this ranking, not which ones were
+        # attempted. `mode` comes from best_search and is already honest about a
+        # skipped dense leg; `dense_rows` is the part nothing reported: a shelf
+        # with zero vectors answers "hybrid" and ranks exactly like bm25, and
+        # that silently-equal pair is what hid the empty vector space for weeks.
+        try:
+            info["dense_rows"] = int(app.state.search.stats("tools").get("vectors", 0))
+            info["lexical_rows"] = int(app.state.search.stats("tools").get("lexical", 0))
+        except Exception:                                          # noqa: BLE001
+            pass
         # A second reranker, on a different dependency. `best_search` reranks with
         # the cross-encoder at the embedding gateway; that gateway returns 401 on
         # this host (2026-10-22) so the dense leg and its reranker both die, while
@@ -596,6 +638,8 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
                 break
         return {"query": q, "mode": info["mode"], "rerank": info["rerank"],
                 "llm_rerank": info.get("llm_rerank"),
+                "dense_rows": info.get("dense_rows"),
+                "lexical_rows": info.get("lexical_rows"),
                 "pool": info["pool"], "notes": notes,
                 "confidence": info["confidence"],
                 "count": len(results), "results": results}
