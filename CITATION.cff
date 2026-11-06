@@ -7,6 +7,6 @@ authors:
     given-names: Yangyi
     affiliation: Georgetown University
 repository-code: "https://github.com/ZhangYangyi03/tool-market"
-license: Apache-2.0
+license: MIT
 type: software
 keywords: [agent tools, tool registry, fastapi, lifecycle, hash chain]
