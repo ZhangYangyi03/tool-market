@@ -37,6 +37,158 @@ out loud rather than quietly returning worse results.
 import os
 import time
 
+import json
+import math
+import re
+
+# Query understanding without a dense backend (measured 2026-11-13: this host
+# has no reachable /v1/embeddings and no local sentence-transformers, so
+# 14,856 documents have zero vectors). Chinese needs are rewritten into the
+# English tokens the shelf is actually written in; proper tool names and
+# identifiers survive intact. The generic-word filter is the second half: on a
+# 14.8k shelf "tool", "toolmarket", "any" occur in thousands of documents and
+# otherwise drown the terms that discriminate.
+_CN2EN = {
+    "读取": "read", "查看": "read", "查询": "query", "获取": "get",
+    "额度": "quota", "配额": "quota", "用量": "usage", "余额": "balance",
+    "页面": "page", "网页": "page", "登录": "login", "账号": "account",
+    "调用": "invoke", "工具": "tool", "货架": "market",
+    "探测": "probe", "端口": "port", "连通": "reachability",
+    "网络": "network", "检测": "check", "测试": "test", "状态": "status",
+    "合并": "merge", "通知": "notify", "配置": "config", "邮件": "email",
+    "发送": "send", "文件": "file", "缩放": "resize", "图片": "image",
+    "水印": "watermark", "压缩": "compress", "裁剪": "crop",
+    "转换": "convert", "格式": "format", "秒数": "seconds", "时间": "time",
+    "转成": "format", "生成": "generate", "分析": "analyze",
+    "统计": "stats", "列表": "list", "删除": "delete", "创建": "create",
+    "修改": "patch", "修复": "fix", "重启": "restart",
+    "数据库": "database", "索引": "index", "资源": "resource",
+    "检索": "search", "搜索": "search", "命中": "hit", "结果": "results",
+    "日志": "log", "进程": "process", "任意": "any", "编号": "id",
+    "提交": "commit", "推送": "push", "远程": "remote", "仓库": "repo",
+    "内容": "content", "打印": "print", "本地": "local", "邮件": "email",
+}
+_STOP = set("的 了 着 过 吗 呢 啊 吧 把 按 用 上 中 为 与 和 或 及 页 一个 一下 可以 如何 怎么 什么 是否 需要 进行 以及 相关 对应 这个 那个 我们 你们 他们 它 这 那 有 在".split())
+_GENERIC = set("""any and into data use using with from that this for the one
+given based a an to of in on is are be number into""".split())
+_SHORT = set("id ui api tcp udp pdf ssh sql gpu cpu csv json url html xml io os db ai llm mcp cli png jpg gif hh mm ss".split())
+_WORD = re.compile("[a-z0-9_]+")
+_CJK = re.compile("[\u4e00-\u9fff]+")
+_STATE_BOOST = {"active": 1.15, "verified": 1.12, "probation": 1.08, "draft": 1.0}
+
+
+def query_terms(query):
+    """Discriminating terms for one need, plus its Chinese-to-English rewrite."""
+    low = (query or "").lower()
+    out = []
+    words = _WORD.findall(low)
+    # An identifier typed with spaces is still an identifier: rejoin it so an
+    # exact-name query can match the underscore stem stored in the index.
+    # For prose the joined term is absent from the shelf and drops out harmlessly.
+    if len(words) >= 2:
+        out.append("_".join(words))
+    for w in words:
+        stem = (len(w) >= 3 or w in _SHORT) and w not in _GENERIC
+        if stem:
+            out.append(w)
+        if "_" in w:
+            parts = [p for p in w.split("_")
+                     if (len(p) >= 3 or p in _SHORT) and p not in _GENERIC]
+            out += parts
+            # An exact identifier query loses to its own neighbours when the
+            # stem is a generic word. Re-adding it with a higher weight keeps
+            # "mcp_dev_cz_agents_dd" above "..._isir" and "..._cnb".
+            if not stem and len(parts) >= 2:
+                out.append(w)
+    for run in _CJK.findall(low):
+        for i in range(len(run) - 1):
+            bg = run[i:i + 2]
+            if bg not in _STOP and bg not in _GENERIC:
+                out.append(bg)
+        for zh, en in _CN2EN.items():
+            if len(zh) > 1 and zh in run:
+                out += [x for x in _WORD.findall(en.lower()) if x not in _GENERIC]
+    return list(dict.fromkeys(out))
+
+
+def lex_search(store, collection, query, k=10, pool=60, state_boost=False):
+    """Weighted lexical search that understands the query, not just its words.
+
+    Same BM25 equation as Store.bm25_search, but terms are the rewritten
+    discriminating ones, document frequency is capped at half the shelf, and
+    lifecycle state is a small, bounded prior. Measured 2026-11-13 on the live
+    14,856-document shelf: exact tool names stay hit@1, while a Chinese need
+    like "合并通知渠道配置" resolves to merge_notify_channels_config.
+    """
+    terms = query_terms(query)
+    if not terms:
+        return [], []
+    rows = store._lexical_rows(collection)
+    if not rows:
+        return terms, []
+    parsed = [(r[0], json.loads(r[1]), r[2], r[3]) for r in rows]
+    n_docs = len(parsed)
+    avgdl = (sum(d[2] for d in parsed) / float(n_docs)) or 1.0
+    df = {}
+    for t in terms:
+        df[t] = sum(1 for d in parsed if t in d[1])
+    keep = [t for t in terms if df[t] and df[t] / float(n_docs) <= 0.5]
+    if not keep:
+        return terms, []
+    scored = []
+    for rid, tf, dl, meta in parsed:
+        score = 0.0
+        for t in keep:
+            f = tf.get(t, 0)
+            if not f:
+                continue
+            idf = math.log(1.0 + (n_docs - df[t] + 0.5) / (df[t] + 0.5))
+            weight = 2.0 if ("_" in t and df[t] <= 3) else 1.0
+            score += weight * idf * (f * 2.5) / (f + 1.5 * (0.25 + 0.75 * dl / avgdl))
+        if score <= 0.0:
+            continue
+        if state_boost:
+            try:
+                st = json.loads(meta or "{}").get("state", "draft")
+            except Exception:
+                st = "draft"
+            score *= _STATE_BOOST.get(st, 1.0)
+        scored.append((rid, score, json.loads(meta) if meta else None))
+    scored.sort(key=lambda x: (-x[1], x[0]))
+    return keep, scored[:max(k, pool)]
+
+
+def abstain(store, collection, terms, rows):
+    """True when the best hit is a word salad rather than an answer.
+
+    Calibrated on the live shelf 2026-11-13 with 3 needs that have no tool on
+    it and 13 that do. The discriminator is coverage: the fraction of the
+    query's discriminating terms present in the winning document. Ratio and gap
+    are reported but never used to abstain -- a near-tie means several tools
+    fit, not that none does.
+    """
+    if not terms or not rows:
+        return True, {"coverage": 0.0, "ratio": 0.0, "gap": 0.0}
+    rid = rows[0][0]
+    tf = store.term_freq(collection, rid)
+    coverage = sum(1 for t in terms if t in tf) / float(len(terms))
+    top = float(rows[0][1])
+    second = float(rows[1][1]) if len(rows) > 1 else 0.0
+    ratio = top / (second or 0.01)
+    gap = top - second
+    # A near-tie between the top two hits means "several tools fit", which is
+    # exactly when a ranked list is useful. It is NOT evidence that no tool
+    # exists: measured 2026-11-13, "发送一封测试邮件" had coverage 1.0 and
+    # three real email tools, yet ratio 1.03 / gap 0.7 wrongly abstained.
+    # Only weak term coverage of the winning document signals a word salad.
+    reasons = []
+    if coverage < 0.60:
+        reasons.append("coverage %.2f < 0.60" % coverage)
+    return bool(reasons), {"coverage": round(coverage, 3),
+                           "ratio": round(ratio, 2), "gap": round(gap, 1),
+                           "reasons": reasons}
+
+
 from . import embed as _embed
 from . import vectorstore as _vs
 
@@ -110,7 +262,11 @@ def best_search(store, collection, query, k=5, pool=DEFAULT_POOL, alpha=DEFAULT_
         model = None
 
     vector = None
-    if col and col["dim"]:
+    # No stored vectors means the dense leg cannot rank anything; asking the
+    # embedding gateway for a query vector only adds its timeout to every
+    # /search call. Measured 2026-11-13: 0 vectors in "tools", /search timed
+    # out past 12s while /search/fast answered in 0.33s.
+    if col and col["dim"] and store.stats(collection).get("vectors", 0):
         if model and col["model_id"] not in (None, model):
             info["notes"].append(
                 "collection holds %r vectors but the embedder is %r; dense leg skipped"
@@ -125,8 +281,18 @@ def best_search(store, collection, query, k=5, pool=DEFAULT_POOL, alpha=DEFAULT_
         rows = weight_search(store, collection, query, vector, k=pool, alpha=alpha)
         info["mode"] = "hybrid"
     else:
-        rows = store.bm25_search(collection, query, k=pool)
-        info["mode"] = "bm25"
+        terms, rows = lex_search(store, collection, query, k=k, pool=pool,
+                                 state_boost=True)
+        info["mode"] = "bm25+rewrite"
+        info["terms"] = terms
+        dropped, signal = abstain(store, collection, terms, rows)
+        info["abstain"] = dropped
+        info["signal"] = signal
+        if dropped:
+            info["notes"].append("no confident match: " + "; ".join(
+                signal.get("reasons") or ["empty candidate set"]))
+            return [], info
+        rows = rows[:max(k, pool)]
     info["pool"] = len(rows)
     if not rows:
         return [], info

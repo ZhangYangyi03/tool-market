@@ -45,7 +45,7 @@ import urllib.request
 DEFAULT_BASE = "http://127.0.0.1:8788/v1"
 DEFAULT_MODEL = "deepseek-v4.1-flash"
 DEFAULT_POOL = 30
-DEFAULT_TIMEOUT = 45.0
+DEFAULT_TIMEOUT = 8.0
 _CONFIG_PATHS = (
     os.environ.get("LLM_RERANK_CONFIG") or "",
     r"C:\Users\china\tools\wbproxy\config.json",
@@ -194,7 +194,7 @@ def order_all(query: str, candidates: list[tuple[str, str]], timeout: float | No
                            "Answer with every number, comma separated, nothing else.")
                           % (query[:700], "\n".join("%d. %s" % (i + 1, n) for i, n in enumerate(names)))}]}
     try:
-        raw = _post(body, s)
+        raw = _post(body, s, tries=1)
     except Exception:                                       # noqa: BLE001
         return None
     order: list[int] = []

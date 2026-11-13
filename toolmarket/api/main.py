@@ -126,6 +126,9 @@ def _startup_sync(store, reg) -> None:
     """
     from .. import embed as _embed
 
+    # Retired resources are a recycle bin, not search results. Index only the
+    # live shelf: otherwise a removed paid MCP keeps winning BM25 queries.
+    live = [r for r in reg.list() if r.state.value != "retired"]
     dim = None
     model = None
     try:
@@ -136,7 +139,7 @@ def _startup_sync(store, reg) -> None:
         dim = model = None
     try:
         store.create_collection("tools", dim=dim, model_id=model)
-        report = store.sync_from_records("tools", [_record_view(r) for r in reg.list()])
+        report = store.sync_from_records("tools", [_record_view(r) for r in live])
     except Exception as exc:  # noqa: BLE001
         import logging
         logging.getLogger("toolmarket.search").warning(
@@ -159,10 +162,10 @@ def _startup_sync(store, reg) -> None:
     # second and removes the whole class: whatever the first pass saw, the
     # second one is asked to be complete.
     try:
-        shelf = len(reg.list())
+        shelf = len(live)
         indexed = store.stats("tools").get("lexical", 0)
         if indexed < shelf:
-            again = store.sync_from_records("tools", [_record_view(r) for r in reg.list()])
+            again = store.sync_from_records("tools", [_record_view(r) for r in live])
             import logging
             logging.getLogger("toolmarket.search").warning(
                 "search index was short (%d of %d); resynced: %s", indexed, shelf, again)
@@ -270,7 +273,8 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
     _startup_sync(app.state.search, reg)
     retrieval.install_health_route(
         app, app.state.search, "tools",
-        lambda: [_record_view(r) for r in reg.list()])
+        lambda: [_record_view(r) for r in reg.list()
+                 if r.state.value != "retired"])
 
 
     # -- staying current when the shelf has more than one writer ------------
@@ -312,11 +316,12 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
             return
         _last_full_sync[0] = now
         try:
-            shelf = len(reg.list())
+            live = [r for r in reg.list() if r.state.value != "retired"]
+            shelf = len(live)
             indexed = app.state.search.stats("tools").get("lexical", 0)
             if shelf and indexed * 1.02 < shelf:
                 app.state.search.sync_from_records(
-                    "tools", [_record_view(r) for r in reg.list()])
+                    "tools", [_record_view(r) for r in live])
         except Exception:  # noqa: BLE001 - a read must not fail on a guard
             pass
 
@@ -329,6 +334,9 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
         if changed:
             try:
                 for rec in changed:
+                    if rec.state.value == "retired":
+                        app.state.search.delete(rec.id, "tools")
+                        continue
                     app.state.search.index_text(
                         "tools", rec.id,
                         _vs.build_resource_text(_record_view(rec)),
@@ -525,6 +533,37 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
         rows = reg.list(type=type, state=state)
         return {"count": len(rows), "resources": [_record_view(r) for r in rows]}
 
+    @app.get("/search/fast")
+    def search_fast(q: str = "", k: int = 5) -> dict[str, Any]:
+        """Bounded lexical discovery; never calls an embedding or language model."""
+        k = max(1, min(int(k), 20))
+        if not q.strip():
+            return {"query": q, "mode": "bm25", "count": 0, "results": []}
+        # The old fast path filtered out draft outright while /search kept them;
+        # with 14,771 of 14,856 live tools in draft that discarded almost the
+        # whole shelf. Both paths now use the same rewritten terms, the same
+        # bounded state prior, and exclude only retired.
+        _terms, rows = retrieval.lex_search(
+            app.state.search, "tools", q[:500], k=k, pool=k * 3,
+            state_boost=True)
+        dropped, signal = retrieval.abstain(
+            app.state.search, "tools", _terms, rows)
+        if dropped:
+            return {"query": q, "mode": "bm25+rewrite", "count": 0,
+                    "results": [], "abstain": True, "signal": signal}
+        results = []
+        for rid, score, _meta in rows:
+            rec = reg.get(rid)
+            if rec is None or rec.state.value == "retired":
+                continue
+            results.append({"resource_id": rid, "name": rec.name,
+                "state": rec.state.value, "score": float(score),
+                "description": (rec.description or "")[:300]})
+            if len(results) >= k:
+                break
+        return {"query": q, "mode": "bm25+rewrite", "count": len(results),
+                "results": results}
+
     @app.get("/search")
     def search(q: str = "", k: int = 10) -> dict[str, Any]:
         _refresh()
@@ -539,9 +578,10 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
         # here from the registry. It is skipped, not faked, when the embedder is
         # unavailable or the index was built by a different model.
         documents = {}
-        for resource_id, _name, _desc in [
-                (r.id, r.name, r.description or "") for r in reg.list()]:
-            documents[resource_id] = (str(_name) + ". " + str(_desc)).strip()
+        for r in reg.list():
+            if r.state.value == "retired":
+                continue
+            documents[r.id] = (str(r.name) + ". " + str(r.description or "")).strip()
         hits, info = retrieval.best_search(
             app.state.search, "tools", q, k=k, documents=documents,
             pool=int(os.environ.get("SEARCH_POOL") or retrieval.DEFAULT_POOL))
@@ -556,7 +596,7 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
         # hit@1 doubled with hit@5 held. Off unless LLM_RERANK=1, because it
         # costs a completion per uncached query.
         notes = list(info.get("notes") or [])
-        if os.environ.get("LLM_RERANK", "1") != "0" and hits:
+        if os.environ.get("LLM_RERANK", "0") == "1" and hits:
             try:
                 from .. import llm_rerank as _lr
 
@@ -587,7 +627,7 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
         results = []
         for resource_id, score, _meta in hits:
             rec = reg.get(resource_id)
-            if rec is None:
+            if rec is None or rec.state.value == "retired":
                 continue
             results.append({"resource_id": resource_id, "name": rec.name,
                             "state": rec.state.value, "score": round(float(score), 6),
@@ -797,6 +837,11 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
                                  actor=_caller(request))
         except Exception as exc:  # LifecycleError
             raise HTTPException(409, str(exc)) from exc
+        if rec.state.value == "retired":
+            try:
+                app.state.search.delete(rec.id, "tools")
+            except Exception:
+                pass
         return _record_view(rec)
 
     @app.post("/resources/{resource_id:path}/invoke")

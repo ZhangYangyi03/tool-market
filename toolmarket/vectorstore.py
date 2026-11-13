@@ -301,6 +301,31 @@ class Store:
             (collection,),
         ).fetchall()
 
+    def term_df(self, collection, terms):
+        """Document frequency for query terms, as a fraction of the shelf.
+
+        One pass over the stored term frequencies; the caller is the abstention
+        gate, which needs to know whether the top hit actually covers the query.
+        """
+        want = set(terms or [])
+        if not want:
+            return {}
+        counts = dict((t, 0) for t in want)
+        n = 0
+        for _rid, raw, _dl, _meta in self._lexical_rows(collection):
+            n += 1
+            tf = json.loads(raw)
+            for t in want:
+                if t in tf:
+                    counts[t] += 1
+        return dict((t, c / float(n or 1)) for t, c in counts.items())
+
+    def term_freq(self, collection, resource_id):
+        row = self.conn.execute(
+            "SELECT tf FROM lexical WHERE collection=? AND resource_id=?",
+            (collection, resource_id)).fetchone()
+        return json.loads(row[0]) if row and row[0] else {}
+
     def bm25_search(self, collection, query, k=5, k1=1.5, b=0.75):
         rows = self._lexical_rows(collection)
         if not rows:
