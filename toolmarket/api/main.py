@@ -101,6 +101,71 @@ if _HAVE_FASTAPI:
         proposer: str = "stub"
 
 
+_DOC_CACHE: dict[str, Any] = {"stamp": None, "docs": {}}
+
+
+def _documents(reg) -> dict[str, str]:
+    """Resource id -> prose, cached until the shelf's shape or count changes.
+
+    The reranker needs text for the candidates it is given, not for the whole
+    shelf, but building the whole dict was what the first edit did. The stamp is
+    (count, latest updated_at) rather than a mutex: a stale-by-one-request cache
+    costs nothing here and a lock in a search route costs latency.
+    """
+    try:
+        recs = [r for r in reg.list() if r.state.value != "retired"]
+    except Exception:
+        return {}
+    stamp = (len(recs), max((getattr(r, "updated_at", "") or "" for r in recs),
+                            default=""))
+    if _DOC_CACHE["stamp"] == stamp:
+        return _DOC_CACHE["docs"]
+    docs = {}
+    for r in recs:
+        docs[r.id] = (str(r.name) + ". " + str(r.description or "")).strip()
+    _DOC_CACHE["stamp"] = stamp
+    _DOC_CACHE["docs"] = docs
+    return docs
+
+
+def _index_resource(search, rec) -> None:
+    """Index one resource on BOTH legs: lexical and dense.
+
+    Calling `index_text` alone is how the shelf grew a lexical row with no
+    vector for every resource registered after startup -- 14,862 such rows were
+    found and backfilled by hand on 2026-11-27. The dense leg is not optional
+    here: `retrieval.best_search` is dense-first, so a resource with no vector
+    is invisible to the mode the routes actually use.
+
+    The embedding is best-effort and loudly silent-proof: if the embedder is
+    down the lexical row is still written and the failure is logged, because a
+    registration must not fail over a search index.
+    """
+    import logging
+
+    from .. import embed as _embed
+    from .. import vectorstore as _vs
+
+    view = _record_view(rec)
+    text = _vs.build_resource_text(view)
+    chash = _vs.hash_text(text)
+    meta = {"name": rec.name, "state": rec.state.value}
+    try:
+        search.index_text("tools", rec.id, text, meta)
+    except Exception:  # noqa: BLE001 - retrieval degrades, the write does not
+        pass
+    try:
+        s = _embed.settings()
+        if not s.get("api_key"):
+            return
+        vec = _embed.embed_texts([text], s=s, batch=1)[0]
+        search.index_vector("tools", rec.id, vec, meta=meta, chash=chash,
+                            model_id=s["model"])
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger("toolmarket.search").warning(
+            "no vector indexed for %s, dense search will miss it: %s", rec.id, exc)
+
+
 def _record_view(rec: ResourceRecord) -> dict[str, Any]:
     d = rec.to_dict()
     d["capability_schema"] = rec.as_capability_schema()
@@ -173,6 +238,26 @@ def _startup_sync(store, reg) -> None:
         import logging
         logging.getLogger("toolmarket.search").warning(
             "search index completeness check failed: %s", exc)
+    # The ANN table is derived, so it is rebuilt whenever it disagrees with the
+    # vectors table -- never trusted to be current. 14,862 rows take ~40 s, which
+    # is startup time, not request time.
+    try:
+        import logging as _logging
+        _log = _logging.getLogger("toolmarket.search")
+        n_vec = store.stats("tools").get("vectors", 0)
+        st = store.ann_status("tools")
+        if st["loaded"] and (st["rows"] != n_vec or n_vec == 0):
+            built = store.ann_build("tools")
+            _log.info("ANN index built: %s (vectors %d)", built, n_vec)
+        elif not st["loaded"]:
+            _log.warning("ANN leg unavailable, dense search falls back to a full "
+                         "scan: %s", st["error"])
+        else:
+            _log.info("ANN index already current: %d rows", st["rows"])
+    except Exception as exc:  # noqa: BLE001
+        import logging as _logging
+        _logging.getLogger("toolmarket.search").warning(
+            "ANN index build failed, dense search falls back to a full scan: %s", exc)
     import logging
     logging.getLogger("toolmarket.search").info(
         "search index ready: %s (dense %s, model %s)", report, bool(dim), model)
@@ -337,10 +422,7 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
                     if rec.state.value == "retired":
                         app.state.search.delete(rec.id, "tools")
                         continue
-                    app.state.search.index_text(
-                        "tools", rec.id,
-                        _vs.build_resource_text(_record_view(rec)),
-                        {"name": rec.name, "state": rec.state.value})
+                    _index_resource(app.state.search, rec)
             except Exception:  # noqa: BLE001 - retrieval degrades, reads do not
                 pass
         return changed
@@ -564,6 +646,22 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
         return {"query": q, "mode": "bm25+rewrite", "count": len(results),
                 "results": results}
 
+    @app.get("/search/ann")
+    def search_ann() -> dict[str, Any]:
+        """Which dense leg is live: the sqlite-vec KNN or the Python fallback.
+
+        A separate route because the two legs answer the same question at very
+        different speed, and 'the search felt slow' is unanswerable without it.
+        """
+        st = app.state.search.ann_status("tools")
+        st["leg"] = "ann" if (st["loaded"] and st["rows"]) else "brute-force"
+        return st
+
+    @app.post("/search/ann/rebuild")
+    def search_ann_rebuild() -> dict[str, Any]:
+        """Rebuild the vec0 table from the float32 blobs already in `vectors`."""
+        return app.state.search.ann_build("tools")
+
     @app.get("/search")
     def search(q: str = "", k: int = 10) -> dict[str, Any]:
         _refresh()
@@ -577,11 +675,10 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
         # needs prose to read, and the index holds tokens, so the text is supplied
         # here from the registry. It is skipped, not faked, when the embedder is
         # unavailable or the index was built by a different model.
-        documents = {}
-        for r in reg.list():
-            if r.state.value == "retired":
-                continue
-            documents[r.id] = (str(r.name) + ". " + str(r.description or "")).strip()
+        # Rebuilt only when the shelf changes. Rebuilding it per request cost a
+        # 4.5 s first query on a 16,920-resource shelf -- the index was never the
+        # bottleneck, the dictionary of prose handed to the reranker was.
+        documents = _documents(reg)
         hits, info = retrieval.best_search(
             app.state.search, "tools", q, k=k, documents=documents,
             pool=int(os.environ.get("SEARCH_POOL") or retrieval.DEFAULT_POOL))
@@ -676,9 +773,7 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
             rec.metadata.update(req.metadata)
         reg.save(rec)
         try:
-            app.state.search.index_text(
-                "tools", rec.id, _vs.build_resource_text(_record_view(rec)),
-                {"name": rec.name, "state": rec.state.value})
+            _index_resource(app.state.search, rec)
         except Exception:
             pass
         return _record_view(rec)
@@ -734,9 +829,7 @@ def create_app(registry: Optional[ResourceRegistry] = None) -> Any:
             # 8 inserted, and `/search` still returned 0. A discovery path whose
             # results the next lookup cannot see is a path that found nothing.
             try:
-                app.state.search.index_text(
-                    "tools", rec.id, _vs.build_resource_text(_record_view(rec)),
-                    {"name": rec.name, "state": rec.state.value})
+                _index_resource(app.state.search, rec)
             except Exception:
                 pass
             results.append({

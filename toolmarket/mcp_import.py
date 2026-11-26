@@ -88,7 +88,21 @@ REMOTE_CALL_TEMPLATE = '''def __NAME__(tool="", arguments=None):
     try:
         payload = json.loads(raw)
     except ValueError:
-        return raw[:4000]
+        # Streamable HTTP MCP often sends JSON-RPC inside SSE data frames.
+        # Join multi-line data fields per event; never truncate valid results.
+        payload = None
+        for event in raw.replace(chr(13) + chr(10), chr(10)).split(chr(10) * 2):
+            lines = [line[5:].lstrip() for line in event.split(chr(10))
+                     if line.startswith("data:")]
+            if lines:
+                try:
+                    candidate = json.loads(chr(10).join(lines))
+                    if isinstance(candidate, dict) and ("result" in candidate or "error" in candidate):
+                        payload = candidate
+                except ValueError:
+                    pass
+        if payload is None:
+            return "INVALID: non-JSON MCP response: " + raw[:4000]
     if "error" in payload:
         return "MCP error: " + json.dumps(payload["error"], ensure_ascii=False)
     result = payload.get("result") or {}

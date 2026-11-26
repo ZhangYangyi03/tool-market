@@ -278,3 +278,18 @@ def test_search_counts_distinct_resources_not_version_rows(reg):
     assert rep["entries"] == 4
     assert rep["found"] == 2 and len(rep["ids"]) == 2
     assert rep["inserted"] == 2
+
+
+def test_remote_template_parses_sse_without_truncating(monkeypatch):
+    import urllib.request
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def read(self):
+            data = {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"text": "x" * 8000}]}}
+            return ("event: message\ndata: " + json.dumps(data) + "\n\n").encode()
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: Response())
+    source = imp.REMOTE_CALL_TEMPLATE.replace("__NAME__", "test_remote").replace("__URL__", "https://example.com/mcp")
+    scope = {}
+    exec(source, scope)
+    assert scope["test_remote"]("search", {"query": "test"}) == "x" * 8000

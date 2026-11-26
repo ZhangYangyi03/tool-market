@@ -384,3 +384,18 @@ def test_synchronous_evolve_is_still_available():
     assert r.status_code in (200, 422), r.text
     if r.status_code == 200:
         assert "committed" in r.json()
+
+
+def test_fast_search_uses_lexical_index_without_remote_models(monkeypatch):
+    c, reg, rid = _client()
+    from unittest.mock import patch
+    rec = reg.get(rid)
+    from toolmarket.protocol.lifecycle import ResourceState
+    rec.state = ResourceState.PROBATION
+    search = c.app.app.state.search
+    monkeypatch.setattr(search, "bm25_search", lambda collection, q, k: [(rid, 1.2, None)])
+    monkeypatch.setattr("toolmarket.retrieval.best_search", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("remote path")))
+    result = c.get("/search/fast", params={"q": "slugify text", "k": 1})
+    assert result.status_code == 200, result.text
+    assert result.json()["mode"] == "bm25"
+    assert result.json()["results"][0]["resource_id"] == rid
