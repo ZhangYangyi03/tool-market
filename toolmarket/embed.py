@@ -158,7 +158,7 @@ def rerank_texts(query, docs, model=None, s=None, retries=3):
     except Exception:
         timeout = 20.0
     try:
-        gap = float(os.environ.get("RERANK_INTERVAL") or "0.35")
+        gap = float(os.environ.get("RERANK_INTERVAL") or "0")
     except Exception:
         gap = 0.35
 
@@ -191,10 +191,37 @@ def rerank_texts(query, docs, model=None, s=None, retries=3):
             time.sleep(0.8 * (attempt + 1))
     raise last
 
+_QUERY_CACHE = {}
+_QUERY_CACHE_CAP = 512
+
+
 def embed_query(text, s=None):
+    """One query vector, memoised for the life of the process.
+
+    Every /search call embedded its query over the network: measured
+    2026-11-26 at 0.33-0.85 s, the single largest slice of a 1.65 s median
+    search -- larger than the dense leg, the bm25 leg and the reranker
+    combined. A repeated need ("send email", typed once and refined twice)
+    paid that again on every call. Keyed on the model as well as the text,
+    so switching embedders mid-process cannot serve a vector from the wrong
+    space; capped and evicted oldest-first, because an unbounded dict on a
+    long-lived server is a leak with a nice name.
+    """
+    key = None
+    if isinstance(text, str) and text.strip():
+        try:
+            key = ((s or settings()).get("model"), text)
+        except Exception:  # noqa: BLE001 - a cache must never be the failure
+            key = None
+    if key is not None and key in _QUERY_CACHE:
+        return _QUERY_CACHE[key]
     vecs = embed_texts([text], s=s, batch=1)
     if not vecs:
         raise EmbedUnavailable("empty embedding for query")
+    if key is not None:
+        if len(_QUERY_CACHE) >= _QUERY_CACHE_CAP:
+            _QUERY_CACHE.pop(next(iter(_QUERY_CACHE)), None)
+        _QUERY_CACHE[key] = vecs[0]
     return vecs[0]
 
 
